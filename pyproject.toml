@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jpeg-pars"
+version = "0.1.0"
+description = "Cluster JPEG drawings by visual similarity with a 1-100 threshold."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+  "scipy>=1.11",
+]
+
+[project.scripts]
+jpeg-pars = "jpeg_pars.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
