@@ -48,6 +48,34 @@ class ImageFeatures:
     ocr_enabled: bool
 
 
+def resolve_tesseract_cmd(explicit_path: str | None = None) -> str | None:
+    if explicit_path:
+        candidate = Path(explicit_path)
+        if candidate.exists():
+            return str(candidate)
+        return None
+
+    env_cmd = os.environ.get("TESSERACT_CMD")
+    if env_cmd:
+        candidate = Path(env_cmd)
+        if candidate.exists():
+            return str(candidate)
+
+    path_cmd = shutil.which("tesseract")
+    if path_cmd:
+        return path_cmd
+
+    common_locations = [
+        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+        Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+    ]
+    for candidate in common_locations:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def load_features(path: Path, ocr_config: OcrConfig | None = None) -> ImageFeatures:
     image = Image.open(path).convert("L")
     normalized = _normalize_image(image)
@@ -171,8 +199,9 @@ def _extract_ocr_features(image: Image.Image, ocr_config: OcrConfig | None) -> t
         return frozenset(), np.zeros(6, dtype=np.float32), False
 
     assert pytesseract is not None
-    if config.tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = config.tesseract_cmd
+    resolved_tesseract = resolve_tesseract_cmd(config.tesseract_cmd)
+    if resolved_tesseract:
+        pytesseract.pytesseract.tesseract_cmd = resolved_tesseract
 
     prepared = image.convert("L")
     prepared = ImageOps.autocontrast(prepared)
@@ -229,13 +258,11 @@ def _normalize_tokens(text: str) -> list[str]:
 def _is_ocr_available(config: OcrConfig) -> bool:
     if pytesseract is None:
         return False
-    if config.tesseract_cmd:
-        return Path(config.tesseract_cmd).exists()
-    env_cmd = os.environ.get("TESSERACT_CMD")
-    if env_cmd and Path(env_cmd).exists():
-        pytesseract.pytesseract.tesseract_cmd = env_cmd
+    resolved = resolve_tesseract_cmd(config.tesseract_cmd)
+    if resolved:
+        pytesseract.pytesseract.tesseract_cmd = resolved
         return True
-    return shutil.which("tesseract") is not None
+    return False
 
 
 def hash_similarity(left: np.ndarray, right: np.ndarray) -> float:

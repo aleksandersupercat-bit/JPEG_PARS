@@ -2,6 +2,8 @@
 
 Утилита для пакетной сортировки JPEG-чертежей и OCR-парсинга размеров через единый графический интерфейс.
 
+Для template OCR теперь приоритетно используется `PaddleOCR`, а `Tesseract` оставлен как fallback.
+
 ## Что умеет
 
 - группирует JPEG по визуальному, структурному и OCR-сходству;
@@ -35,6 +37,23 @@ C:\Program Files\Tesseract-OCR\tesseract.exe
 ```
 
 Если `tesseract.exe` уже есть в `PATH`, отдельный путь указывать не нужно.
+
+## PaddleOCR
+
+Для лучшего распознавания зон с размерами, мелкими символами и вертикальным текстом template-парсер теперь использует `PaddleOCR` как основной backend.
+
+Минимальная установка по официальной схеме:
+
+```powershell
+python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -m pip install paddleocr
+```
+
+Если `PaddleOCR` не установлен, template OCR автоматически откатится на `Tesseract`.
+
+В проекте также отключена проверка доступности model hosters через переменную
+`PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True`, чтобы GUI не подвисал на старте.
+При первом реальном использовании `PaddleOCR` модели все равно могут скачаться один раз.
 
 ## Запуск
 

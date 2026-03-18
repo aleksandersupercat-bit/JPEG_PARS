@@ -9,12 +9,14 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 from .clustering import ClusterResult, cluster_images, materialize_groups
-from .features import OcrConfig
+from .features import OcrConfig, resolve_tesseract_cmd
 from .template_parser import (
+    OcrCandidate,
     ParsedSheet,
     TemplateRegion,
     default_region_name,
     export_results_to_excel,
+    get_template_ocr_backend_info,
     load_template,
     parse_template_batch,
     save_template,
@@ -47,6 +49,7 @@ class JpegParsApp(tk.Tk):
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.group_preview_image: ImageTk.PhotoImage | None = None
         self.template_preview_image: ImageTk.PhotoImage | None = None
+        self.template_preview_cache_key: tuple[int, int, int] | None = None
         self.group_result: ClusterResult | None = None
         self.group_output_dir: Path | None = None
         self.group_path_index: dict[str, Path] = {}
@@ -68,6 +71,7 @@ class JpegParsApp(tk.Tk):
         self.template_drag_item: int | None = None
 
         self._build_ui()
+        self._autofill_tesseract_path()
         self.after(120, self._poll_worker_queue)
 
     def _build_ui(self) -> None:
@@ -81,6 +85,15 @@ class JpegParsApp(tk.Tk):
 
         self._build_grouping_tab(grouping_tab)
         self._build_template_tab(template_tab)
+
+    def _autofill_tesseract_path(self) -> None:
+        resolved = resolve_tesseract_cmd()
+        if not resolved:
+            return
+        if not self.group_tesseract_var.get():
+            self.group_tesseract_var.set(resolved)
+        if not self.template_tesseract_var.get():
+            self.template_tesseract_var.set(resolved)
 
     def _build_grouping_tab(self, parent: ttk.Frame) -> None:
         controls = ttk.LabelFrame(parent, text="Параметры группировки", padding=12)
@@ -233,8 +246,10 @@ class JpegParsApp(tk.Tk):
 
         regions_frame = ttk.LabelFrame(right_pane, text="Метки", padding=8)
         results_frame = ttk.LabelFrame(right_pane, text="Распознанные значения", padding=8)
+        debug_frame = ttk.LabelFrame(right_pane, text="OCR Debug", padding=8)
         right_pane.add(regions_frame, weight=2)
         right_pane.add(results_frame, weight=3)
+        right_pane.add(debug_frame, weight=2)
 
         self.region_tree = ttk.Treeview(regions_frame, columns=("color", "name", "value", "confidence"), show="headings", height=8)
         self.region_tree.heading("color", text="Цвет")
@@ -247,10 +262,28 @@ class JpegParsApp(tk.Tk):
         self.region_tree.column("confidence", width=80, anchor="center")
         self.region_tree.pack(fill="both", expand=True)
         self.region_tree.bind("<Double-1>", self._edit_region_name)
+        self.region_tree.bind("<<TreeviewSelect>>", self._on_region_tree_select)
 
         self.results_tree = ttk.Treeview(results_frame, show="headings")
         self.results_tree.pack(fill="both", expand=True)
         self.results_tree.bind("<<TreeviewSelect>>", self._on_result_row_select)
+
+        self.debug_tree = ttk.Treeview(
+            debug_frame,
+            columns=("variant", "backend", "text", "confidence", "score"),
+            show="headings",
+        )
+        self.debug_tree.heading("variant", text="Variant")
+        self.debug_tree.heading("backend", text="Backend")
+        self.debug_tree.heading("text", text="Text")
+        self.debug_tree.heading("confidence", text="Conf")
+        self.debug_tree.heading("score", text="Score")
+        self.debug_tree.column("variant", width=120, anchor="w")
+        self.debug_tree.column("backend", width=80, anchor="center")
+        self.debug_tree.column("text", width=220, anchor="w")
+        self.debug_tree.column("confidence", width=70, anchor="e")
+        self.debug_tree.column("score", width=70, anchor="e")
+        self.debug_tree.pack(fill="both", expand=True)
 
         self.template_status_var = tk.StringVar(value="Загрузите шаблон JPEG.")
         ttk.Label(parent, textvariable=self.template_status_var).pack(fill="x", pady=(8, 0))
@@ -353,6 +386,8 @@ class JpegParsApp(tk.Tk):
         self.template_source_image = Image.open(path).convert("RGB")
         self.template_zoom = 1.0
         self.template_manual_pan = False
+        self.template_preview_cache_key = None
+        self.template_preview_image = None
         self.template_image_var.set(path)
         self.template_regions.clear()
         self.template_results.clear()
@@ -392,6 +427,8 @@ class JpegParsApp(tk.Tk):
             self.template_image_var.set(str(image_path))
             self.template_zoom = 1.0
             self.template_manual_pan = False
+            self.template_preview_cache_key = None
+            self.template_preview_image = None
         self._refresh_region_tree()
         self._refresh_results_tree()
         self._render_template_canvas()
@@ -517,8 +554,11 @@ class JpegParsApp(tk.Tk):
         scale = max(scale, 0.05)
         display_width = max(1, int(image.width * scale))
         display_height = max(1, int(image.height * scale))
-        resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
-        self.template_preview_image = ImageTk.PhotoImage(resized)
+        cache_key = (id(self.template_source_image), display_width, display_height)
+        if self.template_preview_image is None or self.template_preview_cache_key != cache_key:
+            resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
+            self.template_preview_image = ImageTk.PhotoImage(resized)
+            self.template_preview_cache_key = cache_key
 
         self.template_scale = scale
         self.template_display_width = display_width
@@ -560,6 +600,7 @@ class JpegParsApp(tk.Tk):
                     f"{selected_confidences.get(region.name, 0.0):.1f}",
                 ),
             )
+        self._refresh_debug_tree()
 
     def _edit_region_name(self, _: object) -> None:
         selected = self.region_tree.selection()
@@ -598,6 +639,7 @@ class JpegParsApp(tk.Tk):
         self._refresh_region_tree()
         self._refresh_results_tree()
         self._render_template_canvas()
+        self._refresh_debug_tree()
 
     def _start_template_parsing(self) -> None:
         folder = Path(self.template_folder_var.get().strip())
@@ -611,7 +653,7 @@ class JpegParsApp(tk.Tk):
             messagebox.showerror("Ошибка", "Нужно создать хотя бы одну область поиска.")
             return
 
-        self.template_status_var.set("Идет OCR-парсинг по шаблону...")
+        self.template_status_var.set("Идет OCR-парсинг по шаблону... Подготовка OCR backend.")
         self.template_parse_button.config(state="disabled")
         worker = threading.Thread(target=self._run_template_worker, args=(folder,), daemon=True)
         worker.start()
@@ -624,6 +666,11 @@ class JpegParsApp(tk.Tk):
                 languages=self.template_ocr_lang_var.get().strip() or "eng+rus",
                 psm=6,
             )
+            backend, backend_message = get_template_ocr_backend_info(ocr_config)
+            if backend == "none":
+                self.worker_queue.put(("template_error", backend_message))
+                return
+            self.worker_queue.put(("template_status", f"Идет OCR-парсинг по шаблону... Backend: {backend_message}."))
             rows = parse_template_batch(
                 image_folder=folder,
                 regions=self.template_regions,
@@ -655,9 +702,11 @@ class JpegParsApp(tk.Tk):
                 values.append(f"{row.confidences.get(region.name, 0.0):.1f}")
             self.results_tree.insert("", "end", values=values)
         self._refresh_region_tree()
+        self._refresh_debug_tree()
 
     def _on_result_row_select(self, _: object) -> None:
         self._refresh_region_tree()
+        self._refresh_debug_tree()
 
     def _get_selected_template_result(self) -> ParsedSheet | None:
         selected = self.results_tree.selection()
@@ -667,6 +716,39 @@ class JpegParsApp(tk.Tk):
         if 0 <= index < len(self.template_results):
             return self.template_results[index]
         return None
+
+    def _get_selected_region_name(self) -> str | None:
+        selected = self.region_tree.selection()
+        if selected:
+            values = self.region_tree.item(selected[0], "values")
+            if len(values) >= 2:
+                return str(values[1])
+        if self.template_regions:
+            return self.template_regions[0].name
+        return None
+
+    def _on_region_tree_select(self, _: object) -> None:
+        self._refresh_debug_tree()
+
+    def _refresh_debug_tree(self) -> None:
+        self.debug_tree.delete(*self.debug_tree.get_children())
+        selected_result = self._get_selected_template_result()
+        region_name = self._get_selected_region_name()
+        if selected_result is None or not region_name:
+            return
+        candidates = selected_result.debug_candidates.get(region_name, [])
+        for candidate in candidates:
+            self.debug_tree.insert(
+                "",
+                "end",
+                values=(
+                    candidate.variant_name,
+                    candidate.backend,
+                    candidate.text,
+                    f"{candidate.confidence:.1f}",
+                    f"{candidate.score:.1f}",
+                ),
+            )
 
     def _export_template_results(self) -> None:
         if not self.template_results:
@@ -706,6 +788,8 @@ class JpegParsApp(tk.Tk):
                     self._refresh_results_tree()
                     self.template_status_var.set(f"Парсинг завершен. Обработано файлов: {len(self.template_results)}.")
                     self.template_parse_button.config(state="normal")
+                elif event == "template_status":
+                    self.template_status_var.set(str(payload))
                 elif event == "template_error":
                     self.template_status_var.set(f"Ошибка: {payload}")
                     self.template_parse_button.config(state="normal")

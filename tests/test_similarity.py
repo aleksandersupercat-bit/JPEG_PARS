@@ -36,7 +36,11 @@ class ClusterImagesTests(unittest.TestCase):
             _make_test_image(tmp_path / "b.jpg", "close")
             _make_test_image(tmp_path / "c.jpg", "other")
 
-            result = cluster_images(tmp_path, similarity_threshold=70)
+            result = cluster_images(
+                tmp_path,
+                similarity_threshold=70,
+                ocr_config=OcrConfig(mode="off"),
+            )
 
             sizes = sorted(len(group) for group in result.groups)
             self.assertEqual(sizes, [1, 2])
