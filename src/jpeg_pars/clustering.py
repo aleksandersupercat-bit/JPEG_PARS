@@ -5,13 +5,14 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .features import SUPPORTED_EXTENSIONS, ImageFeatures, combined_similarity, load_features
+from .features import OcrConfig, SUPPORTED_EXTENSIONS, ImageFeatures, combined_similarity, load_features
 
 
 @dataclass(slots=True)
 class ClusterResult:
     groups: list[list[Path]]
     scores: dict[str, dict[str, float]]
+    ocr_enabled: bool
 
 
 class UnionFind:
@@ -44,15 +45,24 @@ def discover_images(input_dir: Path, recursive: bool) -> list[Path]:
     return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS)
 
 
-def cluster_images(input_dir: Path, similarity_threshold: int, recursive: bool = False) -> ClusterResult:
+def cluster_images(
+    input_dir: Path,
+    similarity_threshold: int,
+    recursive: bool = False,
+    ocr_config: OcrConfig | None = None,
+) -> ClusterResult:
     files = discover_images(input_dir, recursive=recursive)
     if not files:
         raise ValueError(f"No JPEG files found in {input_dir}")
 
-    features = [load_features(path) for path in files]
+    features = [load_features(path, ocr_config=ocr_config) for path in files]
     groups = _build_groups(features, similarity_threshold)
     scores = _build_score_map(features, groups)
-    return ClusterResult(groups=groups, scores=scores)
+    return ClusterResult(
+        groups=groups,
+        scores=scores,
+        ocr_enabled=any(feature.ocr_enabled for feature in features),
+    )
 
 
 def _build_groups(features: list[ImageFeatures], similarity_threshold: int) -> list[list[Path]]:
@@ -93,6 +103,7 @@ def materialize_groups(
     source_root: Path,
     mode: str = "copy",
     min_group_size: int = 1,
+    ocr_config: OcrConfig | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for index, group in enumerate(result.groups, start=1):
@@ -113,6 +124,12 @@ def materialize_groups(
     report = {
         "source_root": str(source_root),
         "group_count": len(result.groups),
+        "ocr": {
+            "mode": (ocr_config.mode if ocr_config else "auto"),
+            "enabled_for_at_least_one_file": result.ocr_enabled,
+            "languages": (ocr_config.languages if ocr_config else "eng+rus"),
+            "psm": (ocr_config.psm if ocr_config else 6),
+        },
         "groups": [
             {
                 "group": f"group_{index:03d}",

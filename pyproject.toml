@@ -10,12 +10,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
+  "openpyxl>=3.1",
   "Pillow>=10.0",
+  "pytesseract>=0.3.10",
   "scipy>=1.11",
 ]
 
 [project.scripts]
 jpeg-pars = "jpeg_pars.cli:main"
+jpeg-pars-gui = "jpeg_pars.gui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

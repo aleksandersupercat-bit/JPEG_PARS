@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .clustering import cluster_images, materialize_groups
+from .features import OcrConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +37,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Skip writing groups smaller than this value.",
     )
+    parser.add_argument(
+        "--ocr-mode",
+        choices=("auto", "off", "required"),
+        default="auto",
+        help="Use OCR in auto mode, disable it, or require it.",
+    )
+    parser.add_argument(
+        "--tesseract-cmd",
+        type=str,
+        default=None,
+        help="Full path to tesseract.exe if it is not in PATH.",
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        type=str,
+        default="eng+rus",
+        help="OCR languages, for example eng or eng+rus.",
+    )
+    parser.add_argument(
+        "--ocr-psm",
+        type=int,
+        default=6,
+        help="Tesseract page segmentation mode.",
+    )
     return parser
 
 
@@ -51,11 +76,21 @@ def main() -> None:
 
     if args.min_group_size < 1:
         parser.error("--min-group-size must be >= 1")
+    if args.ocr_psm < 0:
+        parser.error("--ocr-psm must be >= 0")
+
+    ocr_config = OcrConfig(
+        mode=args.ocr_mode,
+        tesseract_cmd=args.tesseract_cmd,
+        languages=args.ocr_lang,
+        psm=args.ocr_psm,
+    )
 
     result = cluster_images(
         input_dir=args.input,
         similarity_threshold=args.similarity,
         recursive=args.recursive,
+        ocr_config=ocr_config,
     )
     materialize_groups(
         result=result,
@@ -63,10 +98,14 @@ def main() -> None:
         source_root=args.input,
         mode=args.mode,
         min_group_size=args.min_group_size,
+        ocr_config=ocr_config,
     )
 
     file_count = sum(len(group) for group in result.groups)
-    print(f"Processed {file_count} files into {len(result.groups)} groups. Output: {args.output}")
+    print(
+        f"Processed {file_count} files into {len(result.groups)} groups. "
+        f"OCR active: {'yes' if result.ocr_enabled else 'no'}. Output: {args.output}"
+    )
 
 
 if __name__ == "__main__":

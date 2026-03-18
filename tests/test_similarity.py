@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from jpeg_pars.clustering import cluster_images
+from jpeg_pars.features import OcrConfig
 
 
 def _make_test_image(path: Path, variant: str) -> None:
@@ -39,6 +40,21 @@ class ClusterImagesTests(unittest.TestCase):
 
             sizes = sorted(len(group) for group in result.groups)
             self.assertEqual(sizes, [1, 2])
+
+    def test_ocr_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _make_test_image(tmp_path / "a.jpg", "base")
+            _make_test_image(tmp_path / "b.jpg", "close")
+
+            result = cluster_images(
+                tmp_path,
+                similarity_threshold=70,
+                ocr_config=OcrConfig(mode="off"),
+            )
+
+            self.assertFalse(result.ocr_enabled)
+            self.assertEqual(len(result.groups), 1)
 
 
 if __name__ == "__main__":
