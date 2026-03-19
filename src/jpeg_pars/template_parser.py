@@ -460,7 +460,12 @@ def _extract_with_paddle(image: Image.Image, ocr_config: OcrConfig) -> OcrExtrac
         )
     except Exception:
         return OcrExtraction(text="", confidence=0.0)
-    extraction = _parse_paddle_result(result)
+    # PP-OCRv3 lacks ± in its vocabulary and silently drops the glyph, merging
+    # adjacent digits (e.g. "86±10%kg" → "8610%kg").  Detect the ± visually
+    # and pass its x-position so _parse_paddle_result can inject it at the
+    # correct character index using the recognised text-box coordinates.
+    pm_x = _plus_minus_glyph_x(image)
+    extraction = _parse_paddle_result(result, pm_x=pm_x)
     return _postprocess_extraction(extraction, image)
 
 
@@ -515,7 +520,7 @@ def _postprocess_extraction(extraction: OcrExtraction, image: Image.Image) -> Oc
     return OcrExtraction(text=text, confidence=extraction.confidence)
 
 
-def _parse_paddle_result(result: object) -> OcrExtraction:
+def _parse_paddle_result(result: object, pm_x: int | None = None) -> OcrExtraction:
     texts: list[str] = []
     confidences: list[float] = []
     if not isinstance(result, list):
@@ -525,9 +530,25 @@ def _parse_paddle_result(result: object) -> OcrExtraction:
         if isinstance(node, dict):
             rec_texts = node.get("rec_texts")
             rec_scores = node.get("rec_scores")
+            rec_boxes = node.get("rec_boxes")
             if isinstance(rec_texts, list):
                 for index, text in enumerate(rec_texts):
                     if isinstance(text, str):
+                        # When PP-OCRv3 drops the ± glyph and merges adjacent
+                        # digits (e.g. "8610%kg"), inject ± at the character
+                        # position that matches the visually-detected glyph's
+                        # x-coordinate within the recognised text box.
+                        # rec_boxes may be a numpy array or a plain list.
+                        if pm_x is not None and rec_boxes is not None and index < len(rec_boxes):
+                            try:
+                                box = rec_boxes[index]
+                                bx0 = int(box[0]); bx1 = int(box[2])
+                                if bx0 <= pm_x <= bx1 and len(text) > 0:
+                                    rel = (pm_x - bx0) / max(1, bx1 - bx0)
+                                    idx = max(1, min(len(text), int(rel * len(text) + 0.5)))
+                                    text = text[:idx] + "\u00b1" + text[idx:]
+                            except (IndexError, TypeError, ValueError):
+                                pass
                         texts.append(text)
                         score = 0.0
                         if isinstance(rec_scores, list) and index < len(rec_scores):
@@ -637,19 +658,29 @@ def _merge_plus_minus_tokens(text: str) -> str:
     return normalize_ocr_text(merged)
 
 
-def _contains_plus_minus_symbol(image: Image.Image) -> bool:
+def _plus_minus_glyph_x(image: Image.Image) -> int | None:
+    """Return the x-centre pixel of the ± glyph in *image*, or None if absent.
+
+    Strategy
+    --------
+    1. Binarise the grayscale image.
+    2. Apply a narrow vertical dilation (5×1) so disconnected strokes of the
+       same glyph (e.g. the three horizontal bars of ±) merge into one labeled
+       region, while adjacent characters (separated horizontally) are unaffected.
+    3. For each labeled region that has a roughly square aspect ratio, analyse
+       the *original* (undilated) binary within its bounding box.  The ± glyph
+       produces ≥2 horizontal "runs" of ink (top bar + crossbar, or all three
+       bars) with a dominant central vertical bar, which distinguishes it from
+       letters and digits.
+    """
     data = np.asarray(image.convert("L"), dtype=np.uint8)
     binary = data < 128
     if not np.any(binary):
-        return False
-    # Dilate vertically (5×1 kernel) to merge intra-glyph strokes separated by
-    # up to 2-pixel vertical gaps.  A purely vertical kernel leaves horizontal
-    # character spacing intact, so adjacent characters in a text line are never
-    # accidentally merged into the same labeled region.
+        return None
     merged = ndimage.binary_dilation(binary, structure=np.ones((5, 1), dtype=bool))
     labeled, count = ndimage.label(merged)
     if count == 0:
-        return False
+        return None
     for component_idx in range(1, count + 1):
         ys, xs = np.nonzero(labeled == component_idx)
         if len(ys) < 12:
@@ -663,8 +694,6 @@ def _contains_plus_minus_symbol(image: Image.Image) -> bool:
         ratio = width / max(height, 1)
         if ratio < 0.15 or ratio > 2.2:
             continue
-        # Analyze the ORIGINAL (undilated) binary within this bounding box so
-        # the gaps between ± horizontal bars are preserved in the projection.
         mask = binary[top:bottom, left:right]
         hproj = mask.sum(axis=1).astype(float)
         vproj = mask.sum(axis=0).astype(float)
@@ -676,9 +705,25 @@ def _contains_plus_minus_symbol(image: Image.Image) -> bool:
         v_runs = _count_runs(vproj >= v_threshold)
         dominant_column = int(np.argmax(vproj))
         centered = width * 0.2 <= dominant_column <= width * 0.8
-        if centered and ((h_runs >= 3 and v_runs >= 1) or (h_runs >= 2 and v_runs >= 2)):
-            return True
-    return False
+        if not centered:
+            continue
+        # Three horizontal bars → unambiguous ±
+        if h_runs >= 3 and v_runs >= 1:
+            return (left + right) // 2
+        # Two bars ("+" part of ±, minus bar may be a separate component):
+        # require a strong central vertical-bar peak.  For ± the center column
+        # vproj is typically 2-4× the column average because the thin vertical
+        # bar runs through the full glyph height; round letters like "g"/"d"
+        # have a much flatter column distribution and are rejected here.
+        if h_runs == 2 and vproj.mean() > 0:
+            peak_ratio = float(vproj[dominant_column]) / float(vproj.mean())
+            if peak_ratio >= 1.8:
+                return (left + right) // 2
+    return None
+
+
+def _contains_plus_minus_symbol(image: Image.Image) -> bool:
+    return _plus_minus_glyph_x(image) is not None
 
 
 def _looks_like_noise(text: str) -> bool:
