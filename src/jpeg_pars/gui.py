@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from PIL import Image, ImageTk
 
@@ -39,6 +40,21 @@ COLOR_PALETTE = [
 ]
 
 
+class _TkLogHandler(logging.Handler):
+    """Routes log records to a Tkinter ScrolledText widget via a thread-safe queue."""
+
+    def __init__(self, log_queue: "queue.Queue[str]") -> None:
+        super().__init__()
+        self._q = log_queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._q.put_nowait(msg + "\n")
+        except Exception:
+            pass
+
+
 class JpegParsApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -47,6 +63,7 @@ class JpegParsApp(tk.Tk):
         self.minsize(1260, 760)
 
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.log_queue: queue.Queue[str] = queue.Queue()
         self.group_preview_image: ImageTk.PhotoImage | None = None
         self.template_preview_image: ImageTk.PhotoImage | None = None
         self.template_preview_cache_key: tuple[int, int, int] | None = None
@@ -81,11 +98,57 @@ class JpegParsApp(tk.Tk):
 
         grouping_tab = ttk.Frame(notebook, padding=12)
         template_tab = ttk.Frame(notebook, padding=12)
+        log_tab = ttk.Frame(notebook, padding=4)
         notebook.add(grouping_tab, text="Группировка")
         notebook.add(template_tab, text="Шаблон OCR")
+        notebook.add(log_tab, text="Лог OCR")
 
         self._build_grouping_tab(grouping_tab)
         self._build_template_tab(template_tab)
+        self._build_log_tab(log_tab)
+
+        # Wire up the logger
+        handler = _TkLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d  %(levelname)-5s  %(message)s",
+                                               datefmt="%H:%M:%S"))
+        ocr_logger = logging.getLogger("jpeg_pars.ocr")
+        ocr_logger.setLevel(logging.DEBUG)
+        ocr_logger.addHandler(handler)
+        ocr_logger.propagate = False
+
+    def _build_log_tab(self, parent: ttk.Frame) -> None:
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill="x", pady=(0, 4))
+        ttk.Button(btn_frame, text="Очистить лог", command=self._clear_log).pack(side="left")
+        self.log_level_var = tk.StringVar(value="DEBUG")
+        ttk.Label(btn_frame, text="Уровень:").pack(side="left", padx=(12, 2))
+        level_box = ttk.Combobox(btn_frame, textvariable=self.log_level_var,
+                                 values=["DEBUG", "INFO", "WARNING"], width=9, state="readonly")
+        level_box.pack(side="left")
+        level_box.bind("<<ComboboxSelected>>", self._on_log_level_change)
+
+        self.log_text = scrolledtext.ScrolledText(
+            parent, state="disabled", font=("Courier New", 9),
+            wrap="none", bg="#1e1e1e", fg="#d4d4d4",
+            insertbackground="white",
+        )
+        self.log_text.pack(fill="both", expand=True)
+        # Colour tags for log levels
+        self.log_text.tag_configure("INFO",    foreground="#4ec9b0")
+        self.log_text.tag_configure("DEBUG",   foreground="#9cdcfe")
+        self.log_text.tag_configure("WARNING", foreground="#dcdcaa")
+        self.log_text.tag_configure("ERROR",   foreground="#f44747")
+        # Highlight special chars
+        self.log_text.tag_configure("special", foreground="#ce9178", font=("Courier New", 9, "bold"))
+
+    def _on_log_level_change(self, _: object) -> None:
+        level = getattr(logging, self.log_level_var.get(), logging.DEBUG)
+        logging.getLogger("jpeg_pars.ocr").setLevel(level)
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
 
     def _autofill_tesseract_path(self) -> None:
         resolved = resolve_tesseract_cmd()
@@ -830,7 +893,32 @@ class JpegParsApp(tk.Tk):
                     messagebox.showerror("Ошибка OCR", str(payload))
         except queue.Empty:
             pass
+        self._flush_log_queue()
         self.after(120, self._poll_worker_queue)
+
+    def _flush_log_queue(self) -> None:
+        """Drain the log message queue and append lines to the log panel."""
+        try:
+            lines: list[str] = []
+            while True:
+                lines.append(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if not lines:
+            return
+        self.log_text.configure(state="normal")
+        for line in lines:
+            # Determine tag from level keyword in formatted line
+            tag = "DEBUG"
+            if "  INFO " in line:
+                tag = "INFO"
+            elif "  WARNING " in line:
+                tag = "WARNING"
+            elif "  ERROR " in line:
+                tag = "ERROR"
+            self.log_text.insert("end", line, tag)
+        self.log_text.configure(state="disabled")
+        self.log_text.see("end")
 
     def _fill_group_tree(self, result: ClusterResult) -> None:
         self.group_tree.delete(*self.group_tree.get_children())

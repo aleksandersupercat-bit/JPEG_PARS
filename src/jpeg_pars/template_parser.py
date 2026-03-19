@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import string
 import threading
+import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -29,6 +32,110 @@ except ImportError:
     pytesseract = None
     TesseractOutput = None
 
+_LOG = logging.getLogger("jpeg_pars.ocr")
+
+# Special characters we care about — shown with name in debug output
+_SPECIAL_CHARS: dict[str, str] = {
+    "\u00b1": "±",
+    "\u2300": "∅",
+    "\u00d8": "Ø",
+    "\u03c6": "φ",
+    "%": "%",
+}
+
+
+def _repr_char(c: str) -> str:
+    """Return human-readable representation of a single character."""
+    if c in _SPECIAL_CHARS:
+        return f"[{_SPECIAL_CHARS[c]} U+{ord(c):04X}]"
+    if ord(c) > 127:
+        try:
+            name = unicodedata.name(c, "?")
+        except Exception:
+            name = "?"
+        return f"[U+{ord(c):04X} {name}]"
+    return c
+
+
+def _repr_text(text: str) -> str:
+    """Annotate non-ASCII / special chars in a string for log output."""
+    parts: list[str] = []
+    for c in text:
+        if c in _SPECIAL_CHARS or ord(c) > 127:
+            parts.append(_repr_char(c))
+        else:
+            parts.append(c)
+    return "".join(parts)
+
+
+def _score_breakdown(text: str, confidence: float) -> str:
+    """Return a human-readable score breakdown string."""
+    dim_match = any(p.match(text) for p in DIMENSION_PATTERNS)
+    pm_bonus = 15.0 if "\u00b1" in text else 0.0
+    pct_bonus = 8.0 if "%" in text else 0.0
+    digit_bonus = sum(c.isdigit() for c in text) * 1.2
+    bad_chars = sum(
+        1 for c in text
+        if c not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+        "\u00b1\u2300\u00d8\u03c6%.-"
+    )
+    bad_penalty = bad_chars * 6.0
+    total = confidence + (40.0 if dim_match else 0.0) + pm_bonus + pct_bonus + digit_bonus - bad_penalty
+    parts = [f"conf={confidence:.1f}"]
+    if dim_match:
+        parts.append("+40(dim_match)")
+    if pm_bonus:
+        parts.append(f"+{pm_bonus:.0f}(±)")
+    if pct_bonus:
+        parts.append(f"+{pct_bonus:.0f}(%)")
+    if digit_bonus:
+        parts.append(f"+{digit_bonus:.1f}(digits)")
+    if bad_penalty:
+        parts.append(f"-{bad_penalty:.0f}(bad×{bad_chars})")
+    parts.append(f"= {total:.1f}")
+    return " ".join(parts)
+
+
+# Characters that OCR commonly confuses with ± (U+00B1)
+_PM_LOOKALIKES: dict[str, str] = {
+    "+": "plus without minus bar",
+    "7": "digit 7 (bar on stem)",
+    "1": "digit 1",
+    "I": "letter I",
+    "l": "letter l",
+    "t": "letter t",
+    "T": "letter T",
+    "=": "equals (two bars)",
+}
+
+
+def _log_char_analysis(region_name: str, raw_words: list["OcrCandidate"], final_text: str) -> None:
+    """Log per-character breakdown — focus on where ± might have been lost."""
+    if not _LOG.isEnabledFor(logging.DEBUG):
+        return
+    _LOG.debug("   [%s] ── char analysis ──────────────────────────────────", region_name)
+    # Show final result character by character
+    _LOG.debug("   [%s] final text: %r  (%d chars)",
+               region_name, _repr_text(final_text), len(final_text))
+    for i, c in enumerate(final_text):
+        status = "OK" if c not in _PM_LOOKALIKES else f"SUSPECT — {_PM_LOOKALIKES[c]}"
+        _LOG.debug("   [%s]   char[%d] = %-4s  U+%04X  %-20s  %s",
+                   region_name, i, repr(c), ord(c),
+                   unicodedata.name(c, "?")[:20], status)
+    has_pm = "\u00b1" in final_text
+    _LOG.debug("   [%s] ± present in final: %s", region_name, "YES ✓" if has_pm else "NO ✗")
+    if not has_pm:
+        # Look in raw Tesseract words for what might have replaced it
+        _LOG.debug("   [%s] searching raw words for ± lookalikes:", region_name)
+        for w in raw_words:
+            if w.variant_name == "tess_raw":
+                for c in w.text:
+                    if c in _PM_LOOKALIKES:
+                        _LOG.debug("   [%s]   tess_raw word=%r  char=%r → might be ±  (%s)",
+                                   region_name, w.text, c, _PM_LOOKALIKES[c])
+    _LOG.debug("   [%s] ────────────────────────────────────────────────────", region_name)
+
 
 PLUS_MINUS_PATTERNS = [
     re.compile(r"(?<=\d)\s*\+\s*/?\s*-\s*(?=\d)"),
@@ -43,6 +150,7 @@ DIMENSION_PATTERNS = [
     re.compile(r"^\d{1,4}\u00b1\d{1,3}$"),
     re.compile(r"^[\u2300\u00d8\u03c6]\d{1,4}\u00b1\d{1,3}$"),
     re.compile(r"^\d{1,4}\u00b1\d{1,3}%$"),
+    re.compile(r"^\d{1,4}\u00b1\d{1,3}%[a-zA-Z]{1,4}$"),
     re.compile(r"^[\u2300\u00d8\u03c6]?\d{1,4}(?:\.\d+)?$"),
 ]
 
@@ -103,17 +211,29 @@ def parse_template_batch(
 ) -> list[ParsedSheet]:
     _ensure_ocr_ready(ocr_config)
     files = list_jpeg_files(image_folder, recursive=recursive)
+    _LOG.info("parse_template_batch: %d file(s), %d region(s), backend=%s, model=%s",
+              len(files), len(regions), _preferred_backend(ocr_config), ocr_config.ocr_version)
     results: list[ParsedSheet] = []
     for path in files:
+        t_file = time.perf_counter()
         image = Image.open(path).convert("RGB")
+        _LOG.info("── FILE: %s  size=%dx%d", path.name, image.width, image.height)
         values: dict[str, str] = {}
         confidences: dict[str, float] = {}
         debug_candidates: dict[str, list[OcrCandidate]] = {}
         for region in regions:
-            extraction, candidates = extract_region_text(image, region, ocr_config)
+            t_region = time.perf_counter()
+            extraction, candidates = extract_region_text(
+                image, region, ocr_config, full_page_cache=None
+            )
+            elapsed = (time.perf_counter() - t_region) * 1000
+            result_repr = _repr_text(extraction.text) if extraction.text else "(empty)"
+            _LOG.info("   region %-4s → %-30s  conf=%.1f  %.0fms",
+                      region.name, result_repr, extraction.confidence, elapsed)
             values[region.name] = extraction.text
             confidences[region.name] = extraction.confidence
             debug_candidates[region.name] = candidates
+        _LOG.info("── FILE done: %.0fms", (time.perf_counter() - t_file) * 1000)
         results.append(
             ParsedSheet(
                 file_name=path.name,
@@ -126,7 +246,12 @@ def parse_template_batch(
     return results
 
 
-def extract_region_text(image: Image.Image, region: TemplateRegion, ocr_config: OcrConfig) -> tuple[OcrExtraction, list["OcrCandidate"]]:
+def extract_region_text(
+    image: Image.Image,
+    region: TemplateRegion,
+    ocr_config: OcrConfig,
+    full_page_cache: object = None,
+) -> tuple[OcrExtraction, list["OcrCandidate"]]:
     width, height = image.size
     box = (
         int(region.x0 * width),
@@ -139,28 +264,33 @@ def extract_region_text(image: Image.Image, region: TemplateRegion, ocr_config: 
         return OcrExtraction(text="", confidence=0.0), []
 
     backend = _preferred_backend(ocr_config)
+    _LOG.debug("   [%s] box=%s  crop=%dx%d  backend=%s",
+               region.name, box, cropped.width, cropped.height, backend)
     if backend == "paddle":
-        # PaddleOCR has its own text detection: pass the full region crop
-        # directly so the model can locate all text lines in one call.
-        # Splitting into thin line strips forces extreme rescaling inside
-        # PaddleOCR (e.g. a 12 px strip → 1888 px wide after limit_side_len
-        # upscaling), which is both slow and inaccurate.
         all_candidates: list[OcrCandidate] = []
 
+        t0 = time.perf_counter()
         prepared = _prepare_paddle_image(cropped)
         extraction = _extract_with_paddle(prepared, ocr_config)
+        _LOG.debug("   [%s] paddle_crop: %.0fms  crop=%dx%d  raw=%r  conf=%.1f",
+                   region.name, (time.perf_counter() - t0) * 1000,
+                   cropped.width, cropped.height,
+                   extraction.text, extraction.confidence)
+
         if extraction.text:
+            sc = score_candidate(extraction.text, extraction.confidence)
+            _LOG.debug("   [%s] paddle candidate: %s  score=(%s)",
+                       region.name, _repr_text(extraction.text),
+                       _score_breakdown(extraction.text, extraction.confidence))
             all_candidates.append(OcrCandidate(
-                variant_name="gray",
+                variant_name="paddle",
                 backend="paddle",
                 text=extraction.text,
                 confidence=extraction.confidence,
-                score=score_candidate(extraction.text, extraction.confidence),
+                score=sc,
             ))
 
-        # For vertically-elongated regions the text is likely written top-to-
-        # bottom or bottom-to-top.  Try both 90° rotations and keep whichever
-        # produces the highest score.
+        # For vertically-elongated regions try both 90° rotations.
         region_w = region.x1 - region.x0
         region_h = region.y1 - region.y0
         if region_h > region_w * 1.5:
@@ -176,37 +306,57 @@ def extract_region_text(image: Image.Image, region: TemplateRegion, ocr_config: 
                         score=score_candidate(ext_rot.text, ext_rot.confidence),
                     ))
 
+        # Tesseract supplementary pass: run one variant so its output is
+        # visible in OCR Debug and can rescue ± that Paddle dropped.
+        t0 = time.perf_counter()
+        tess_extraction, tess_raw = _tesseract_quick_pass(cropped, ocr_config)
+        _LOG.debug("   [%s] tess_quick: %.0fms  result=%r  conf=%.1f  words=%d",
+                   region.name, (time.perf_counter() - t0) * 1000,
+                   tess_extraction.text, tess_extraction.confidence, len(tess_raw))
+        if tess_raw:
+            _LOG.debug("   [%s] tess_words:", region.name)
+            for w in tess_raw:
+                pm_flag = " ← [± MISSED?]" if w.text.strip() in ("7", "1", "I", "l", "+") else ""
+                _LOG.debug("         word %-12s conf=%5.1f  repr=%s%s",
+                           repr(w.text), w.confidence, _repr_text(w.text), pm_flag)
+            all_candidates.extend(tess_raw)
+        if tess_extraction.text:
+            _LOG.debug("   [%s] tess candidate: %s  score=(%s)",
+                       region.name, _repr_text(tess_extraction.text),
+                       _score_breakdown(tess_extraction.text, tess_extraction.confidence))
+            all_candidates.append(OcrCandidate(
+                variant_name="tess_gray",
+                backend="tesseract",
+                text=tess_extraction.text,
+                confidence=tess_extraction.confidence,
+                score=score_candidate(tess_extraction.text, tess_extraction.confidence),
+            ))
+
         if not all_candidates:
+            _LOG.debug("   [%s] no candidates → empty", region.name)
             return OcrExtraction(text="", confidence=0.0), []
-        best = max(all_candidates, key=lambda c: c.score)
+        real_candidates = [c for c in all_candidates if c.variant_name != "tess_raw"]
+        best = max(real_candidates, key=lambda c: c.score) if real_candidates else max(all_candidates, key=lambda c: c.score)
+        _LOG.debug("   [%s] WINNER: backend=%-10s variant=%-14s text=%s  score=(%.1f)",
+                   region.name, best.backend, best.variant_name,
+                   _repr_text(best.text), best.score)
+        raw_words = [c for c in all_candidates if c.variant_name == "tess_raw"]
+        _log_char_analysis(region.name, raw_words, best.text)
         return (
             OcrExtraction(text=best.text, confidence=best.confidence),
             sorted(all_candidates, key=lambda c: c.score, reverse=True),
         )
 
-    # Tesseract path: split into individual text lines first.
+    # Tesseract path: process the whole region — splitting into narrow
+    # horizontal strips caused Tesseract to read garbage because the strips
+    # were too thin and contained confusing vertical border artefacts.
     inner = _crop_inner_border(cropped)
-    lines = _split_text_lines(inner)
-    if not lines:
-        lines = [inner]
-
-    line_results: list[OcrExtraction] = []
-    all_candidates: list[OcrCandidate] = []
-    for line in lines:
-        extraction, candidates = _recognize_line(line, ocr_config)
-        if extraction.text:
-            line_results.append(extraction)
-        all_candidates.extend(candidates)
-
-    if not line_results:
-        return OcrExtraction(text="", confidence=0.0), all_candidates
-    merged_text = normalize_ocr_text(" ".join(item.text for item in line_results))
-    merged_conf = sum(item.confidence for item in line_results) / len(line_results)
-    return OcrExtraction(text=merged_text, confidence=merged_conf), sorted(
-        all_candidates,
-        key=lambda item: item.score,
-        reverse=True,
-    )
+    _LOG.debug("   [%s] tesseract: inner=%dx%d", region.name, inner.width, inner.height)
+    extraction, all_candidates = _recognize_line(inner, ocr_config)
+    _LOG.debug("   [%s] tesseract result: %r  conf=%.1f", region.name, extraction.text, extraction.confidence)
+    raw_words = [c for c in all_candidates if c.variant_name == "tess_raw"]
+    _log_char_analysis(region.name, raw_words, extraction.text)
+    return extraction, sorted(all_candidates, key=lambda c: c.score, reverse=True)
 
 
 def export_results_to_excel(
@@ -294,8 +444,9 @@ def _recognize_line(image: Image.Image, ocr_config: OcrConfig) -> tuple[OcrExtra
                 )
             )
     elif backend == "tesseract":
+        raw_words_added = False
         for variant_name, variant in _preprocess_variants(image):
-            extraction = _extract_with_tesseract(variant, ocr_config)
+            extraction, raw_cands = _extract_with_tesseract(variant, ocr_config)
             if extraction.text:
                 candidates.append(
                     OcrCandidate(
@@ -306,6 +457,10 @@ def _recognize_line(image: Image.Image, ocr_config: OcrConfig) -> tuple[OcrExtra
                         score=score_candidate(extraction.text, extraction.confidence),
                     )
                 )
+            # Add raw word-level output from the first variant to debug window
+            if not raw_words_added and raw_cands:
+                candidates.extend(raw_cands)
+                raw_words_added = True
     if not candidates:
         return OcrExtraction(text="", confidence=0.0), []
     best = max(candidates, key=lambda item: item.score)
@@ -344,13 +499,19 @@ def _preprocess_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
 
 def _prepare_base_image(image: Image.Image) -> Image.Image:
     inner = _crop_inner_border(image)
+    orig_w, orig_h = inner.size
     gray = ImageOps.autocontrast(inner.convert("L"))
     upscale = 6 if max(gray.size) < 220 else 4
     gray = gray.resize((max(1, gray.width * upscale), max(1, gray.height * upscale)), Image.Resampling.LANCZOS)
-    gray = gray.filter(ImageFilter.MedianFilter(size=3))
-    gray = ImageEnhance.Sharpness(gray).enhance(2.4)
-    if gray.height > 100:
+    # Note: MedianFilter and heavy sharpening were removed — they degraded OCR
+    # quality on technical fonts (digits + ± glyph).  Autocontrast + upscale is
+    # sufficient.  _remove_long_lines is kept only for wide images that are
+    # likely to contain actual table borders (orig_w > 300px).
+    if gray.height > 100 and orig_w > 300:
+        _LOG.debug("      _remove_long_lines: orig_w=%d (applied)", orig_w)
         gray = _remove_long_lines(gray)
+    else:
+        _LOG.debug("      _remove_long_lines: orig_w=%d (skipped)", orig_w)
     return gray
 
 
@@ -384,8 +545,11 @@ def _prepare_paddle_image(image: Image.Image) -> Image.Image:
 def _remove_long_lines(image: Image.Image) -> Image.Image:
     data = np.asarray(image, dtype=np.uint8)
     binary = data < min(220, int(np.percentile(data, 78)))
-    horizontal_len = max(18, binary.shape[1] // 5)
-    vertical_len = max(18, binary.shape[0] // 5)
+    # Use 85% of dimension: character strokes span ~50-75% of image height/width,
+    # actual cell borders span 100%.  The old width//5 (20%) threshold was
+    # removing character strokes and the ± horizontal bar.
+    horizontal_len = max(40, binary.shape[1] * 17 // 20)  # 85 % of width
+    vertical_len   = max(40, binary.shape[0] * 17 // 20)  # 85 % of height
     horizontal_lines = ndimage.binary_opening(binary, structure=np.ones((1, horizontal_len), dtype=bool))
     vertical_lines = ndimage.binary_opening(binary, structure=np.ones((vertical_len, 1), dtype=bool))
     cleaned = binary & ~(horizontal_lines | vertical_lines)
@@ -445,6 +609,132 @@ def _split_text_lines(image: Image.Image) -> list[Image.Image]:
     return results
 
 
+_PADDLE_MAX_SIDE = 4000
+
+
+def _precompute_full_page_paddle(image: Image.Image, ocr_config: OcrConfig) -> object:
+    """Run PaddleOCR once on the full image and return the raw result for reuse.
+
+    Pre-scales the image to fit within _PADDLE_MAX_SIDE so PaddleOCR does not
+    need to resize internally (suppresses the "exceeds max_side_limit" message).
+    Returns None if Paddle is not available so callers fall back to per-crop mode.
+    Returns a dict {"result": ..., "scale": float} on success.
+    """
+    engine = _get_paddle_engine(ocr_config)
+    if engine is None:
+        return None
+    img = image.convert("RGB")
+    w, h = img.size
+    scale = min(_PADDLE_MAX_SIDE / w, _PADDLE_MAX_SIDE / h, 1.0)
+    if scale < 1.0:
+        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    paddle_input = np.asarray(img)
+    try:
+        result = engine.predict(
+            paddle_input,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_rec_score_thresh=0.0,
+        )
+        return {"result": result, "scale": scale}
+    except Exception:
+        return None
+
+
+def _extract_region_from_cache(
+    cached_result: object,
+    box: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+) -> OcrExtraction:
+    """Extract text for one region from a cached full-page PaddleOCR result.
+
+    Walks the result tree, collects text boxes whose centre falls inside *box*,
+    and returns a merged OcrExtraction.
+    """
+    if not isinstance(cached_result, dict):
+        return OcrExtraction(text="", confidence=0.0)
+    raw_result = cached_result["result"]
+    scale: float = cached_result.get("scale", 1.0)
+    # Scale region box to the coordinate space PaddleOCR used.
+    rx0, ry0, rx1, ry1 = (c * scale for c in box)
+    texts: list[str] = []
+    confidences: list[float] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            rec_texts = node.get("rec_texts")
+            rec_scores = node.get("rec_scores")
+            rec_boxes = node.get("rec_boxes")
+            if isinstance(rec_texts, list) and rec_boxes is not None:
+                for idx, text in enumerate(rec_texts):
+                    if not isinstance(text, str):
+                        continue
+                    try:
+                        raw_box = rec_boxes[idx]
+                        # True centre of flat [x0,y0,x1,y1] OR 4-point polygon.
+                        coords = np.asarray(raw_box, dtype=float).reshape(-1)
+                        n = coords.size
+                        if n >= 8:
+                            # 4-point polygon [[x0,y0],[x1,y1],[x2,y2],[x3,y3]]
+                            cx = coords[0::2].mean()
+                            cy = coords[1::2].mean()
+                        elif n >= 4:
+                            cx = (coords[0] + coords[2]) / 2.0
+                            cy = (coords[1] + coords[3]) / 2.0
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                    inside = rx0 <= cx <= rx1 and ry0 <= cy <= ry1
+                    _LOG.debug("      cache_box: %r  cx=%.0f cy=%.0f  region=(%.0f,%.0f,%.0f,%.0f)  %s",
+                               text, cx, cy, rx0, ry0, rx1, ry1,
+                               "HIT" if inside else "miss")
+                    if inside:
+                        texts.append(text)
+                        score = 0.0
+                        if isinstance(rec_scores, list) and idx < len(rec_scores):
+                            try:
+                                score = float(rec_scores[idx])
+                            except (TypeError, ValueError):
+                                pass
+                        confidences.append(score * 100.0 if score <= 1.0 else score)
+            for v in node.values():
+                walk(v)
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(raw_result)
+    if not texts:
+        return OcrExtraction(text="", confidence=0.0)
+    return _postprocess_extraction(OcrExtraction(
+        text=normalize_ocr_text(" ".join(texts)),
+        confidence=sum(confidences) / len(confidences),
+    ))
+
+
+def _tesseract_quick_pass(
+    image: Image.Image, ocr_config: OcrConfig
+) -> tuple[OcrExtraction, list["OcrCandidate"]]:
+    """Run one Tesseract variant on *image* for debug visibility in Paddle mode.
+
+    Uses the upscaled-gray variant only (no multi-variant sweep) to keep
+    overhead low.  Returns (extraction, raw_word_candidates).
+    """
+    if pytesseract is None or not resolve_tesseract_cmd(ocr_config.tesseract_cmd):
+        return OcrExtraction(text="", confidence=0.0), []
+    inner = _crop_inner_border(image)
+    gray = ImageOps.autocontrast(inner.convert("L"))
+    upscale = 6 if max(gray.size) < 220 else 4
+    gray = gray.resize(
+        (max(1, gray.width * upscale), max(1, gray.height * upscale)),
+        Image.Resampling.LANCZOS,
+    )
+    return _extract_with_tesseract(gray, ocr_config)
+
+
 def _extract_with_paddle(image: Image.Image, ocr_config: OcrConfig) -> OcrExtraction:
     engine = _get_paddle_engine(ocr_config)
     if engine is None:
@@ -460,19 +750,16 @@ def _extract_with_paddle(image: Image.Image, ocr_config: OcrConfig) -> OcrExtrac
         )
     except Exception:
         return OcrExtraction(text="", confidence=0.0)
-    # PP-OCRv3 lacks ± in its vocabulary and silently drops the glyph, merging
-    # adjacent digits (e.g. "86±10%kg" → "8610%kg").  Detect the ± visually
-    # and pass its x-position so _parse_paddle_result can inject it at the
-    # correct character index using the recognised text-box coordinates.
-    pm_x = _plus_minus_glyph_x(image)
-    extraction = _parse_paddle_result(result, pm_x=pm_x)
-    return _postprocess_extraction(extraction, image)
+    extraction = _parse_paddle_result(result)
+    return _postprocess_extraction(extraction)
 
 
-def _extract_with_tesseract(image: Image.Image, ocr_config: OcrConfig) -> OcrExtraction:
+def _extract_with_tesseract(
+    image: Image.Image, ocr_config: OcrConfig
+) -> tuple[OcrExtraction, list["OcrCandidate"]]:
     _apply_tesseract_cmd(ocr_config)
     if pytesseract is None:
-        return OcrExtraction(text="", confidence=0.0)
+        return OcrExtraction(text="", confidence=0.0), []
     try:
         data = pytesseract.image_to_data(
             image,
@@ -481,46 +768,47 @@ def _extract_with_tesseract(image: Image.Image, ocr_config: OcrConfig) -> OcrExt
             output_type=TesseractOutput.DICT,
         )
     except Exception:
-        return OcrExtraction(text="", confidence=0.0)
+        return OcrExtraction(text="", confidence=0.0), []
 
     parts: list[str] = []
     confidence_values: list[float] = []
+    raw_candidates: list[OcrCandidate] = []
     for text, confidence in zip(data.get("text", []), data.get("conf", [])):
-        normalized = normalize_ocr_text(str(text))
-        if not normalized:
-            continue
+        raw = str(text).strip()
         try:
             score = float(confidence)
         except (TypeError, ValueError):
-            continue
-        if score < 0:
+            score = -1.0
+        normalized = normalize_ocr_text(raw)
+        if raw:
+            raw_candidates.append(OcrCandidate(
+                variant_name="tess_raw",
+                backend="tesseract",
+                text=normalized if normalized else raw,  # show normalized so ± is visible
+                confidence=max(0.0, score),
+                score=max(0.0, score),
+            ))
+        if not normalized or score < 0:
             continue
         parts.append(normalized)
         confidence_values.append(score)
     if not parts:
-        return OcrExtraction(text="", confidence=0.0)
+        return OcrExtraction(text="", confidence=0.0), raw_candidates
     extraction = OcrExtraction(
         text=normalize_ocr_text(" ".join(parts)),
         confidence=sum(confidence_values) / len(confidence_values),
     )
-    return _postprocess_extraction(extraction, image)
+    return _postprocess_extraction(extraction), raw_candidates
 
 
-def _postprocess_extraction(extraction: OcrExtraction, image: Image.Image) -> OcrExtraction:
-    if _contains_plus_minus_symbol(image):
-        # Pass the raw text to _merge_plus_minus_tokens BEFORE normalize_ocr_text
-        # removes spaces. If Paddle skips ± and outputs "120 0.5", the space is
-        # the only separator available — normalize_ocr_text would collapse it to
-        # "1200.5" first, leaving nothing to merge on.
-        text = _merge_plus_minus_tokens(extraction.text)
-    else:
-        text = normalize_ocr_text(extraction.text)
+def _postprocess_extraction(extraction: OcrExtraction) -> OcrExtraction:
+    text = normalize_ocr_text(extraction.text)
     if _looks_like_noise(text):
         return OcrExtraction(text="", confidence=0.0)
     return OcrExtraction(text=text, confidence=extraction.confidence)
 
 
-def _parse_paddle_result(result: object, pm_x: int | None = None) -> OcrExtraction:
+def _parse_paddle_result(result: object) -> OcrExtraction:
     texts: list[str] = []
     confidences: list[float] = []
     if not isinstance(result, list):
@@ -530,25 +818,9 @@ def _parse_paddle_result(result: object, pm_x: int | None = None) -> OcrExtracti
         if isinstance(node, dict):
             rec_texts = node.get("rec_texts")
             rec_scores = node.get("rec_scores")
-            rec_boxes = node.get("rec_boxes")
             if isinstance(rec_texts, list):
                 for index, text in enumerate(rec_texts):
                     if isinstance(text, str):
-                        # When PP-OCRv3 drops the ± glyph and merges adjacent
-                        # digits (e.g. "8610%kg"), inject ± at the character
-                        # position that matches the visually-detected glyph's
-                        # x-coordinate within the recognised text box.
-                        # rec_boxes may be a numpy array or a plain list.
-                        if pm_x is not None and rec_boxes is not None and index < len(rec_boxes):
-                            try:
-                                box = rec_boxes[index]
-                                bx0 = int(box[0]); bx1 = int(box[2])
-                                if bx0 <= pm_x <= bx1 and len(text) > 0:
-                                    rel = (pm_x - bx0) / max(1, bx1 - bx0)
-                                    idx = max(1, min(len(text), int(rel * len(text) + 0.5)))
-                                    text = text[:idx] + "\u00b1" + text[idx:]
-                            except (IndexError, TypeError, ValueError):
-                                pass
                         texts.append(text)
                         score = 0.0
                         if isinstance(rec_scores, list) and index < len(rec_scores):
@@ -628,6 +900,7 @@ def _preferred_backend(ocr_config: OcrConfig) -> str:
 
 def _normalize_measurement_text(text: str) -> str:
     normalized = text.strip()
+    original = normalized
     replacements = {
         "=": "\u00b1",
         "+-": "\u00b1",
@@ -642,88 +915,37 @@ def _normalize_measurement_text(text: str) -> str:
         "$": "\u2300",
     }
     for source, target in replacements.items():
+        before = normalized
         normalized = normalized.replace(source, target)
+        if normalized != before:
+            _LOG.debug("      norm: %r → %r  (replaced %r→%r)",
+                       _repr_text(before), _repr_text(normalized), source, target)
+    before = normalized
     normalized = normalized.replace("°/o", "%")
+    if normalized != before:
+        _LOG.debug("      norm: degree/o → %%")
+    before = normalized
     for pattern in PLUS_MINUS_PATTERNS:
         normalized = pattern.sub("\u00b1", normalized)
+    # Also convert trailing + after digits — OCR sometimes reads "86±" as "86+"
+    # when ± is at the end of the visible area (no digit follows in the crop).
+    normalized = re.sub(r"(?<=\d)\+$", "\u00b1", normalized)
+    if normalized != before:
+        _LOG.debug("      norm: pm_pattern: %r → %r", _repr_text(before), _repr_text(normalized))
     normalized = re.sub(r"\s*%\s*", "%", normalized)
     normalized = re.sub(r"\s*\u00b1\s*", "\u00b1", normalized)
+    before = normalized
+    # Space between digits in dimension context means OCR dropped ± glyph:
+    # "86 10%kg" → "86±10%kg", "296 5" → "296±5"
+    # Tolerance is usually 1-2 digits (or 1-3 before %)
+    normalized = re.sub(r"(?<=\d) (?=\d{1,2}(?:[^\d]|$))", "\u00b1", normalized)
+    normalized = re.sub(r"(?<=\d) (?=\d{1,3}%)", "\u00b1", normalized)
+    if normalized != before:
+        _LOG.debug("      norm: space→± : %r → %r", _repr_text(before), _repr_text(normalized))
     normalized = normalized.replace(" ", "")
+    if normalized != original:
+        _LOG.debug("      norm: final: %r → %r", _repr_text(original), _repr_text(normalized))
     return normalized
-
-
-def _merge_plus_minus_tokens(text: str) -> str:
-    merged = re.sub(r"(?<=\d)\s*[+=~-]\s*(?=\d)", "\u00b1", text)
-    merged = re.sub(r"(?<=\d)\s+(?=\d{1,3}(?:\D|$))", "\u00b1", merged, count=1)
-    return normalize_ocr_text(merged)
-
-
-def _plus_minus_glyph_x(image: Image.Image) -> int | None:
-    """Return the x-centre pixel of the ± glyph in *image*, or None if absent.
-
-    Strategy
-    --------
-    1. Binarise the grayscale image.
-    2. Apply a narrow vertical dilation (5×1) so disconnected strokes of the
-       same glyph (e.g. the three horizontal bars of ±) merge into one labeled
-       region, while adjacent characters (separated horizontally) are unaffected.
-    3. For each labeled region that has a roughly square aspect ratio, analyse
-       the *original* (undilated) binary within its bounding box.  The ± glyph
-       produces ≥2 horizontal "runs" of ink (top bar + crossbar, or all three
-       bars) with a dominant central vertical bar, which distinguishes it from
-       letters and digits.
-    """
-    data = np.asarray(image.convert("L"), dtype=np.uint8)
-    binary = data < 128
-    if not np.any(binary):
-        return None
-    merged = ndimage.binary_dilation(binary, structure=np.ones((5, 1), dtype=bool))
-    labeled, count = ndimage.label(merged)
-    if count == 0:
-        return None
-    for component_idx in range(1, count + 1):
-        ys, xs = np.nonzero(labeled == component_idx)
-        if len(ys) < 12:
-            continue
-        top, bottom = int(ys.min()), int(ys.max()) + 1
-        left, right = int(xs.min()), int(xs.max()) + 1
-        height = bottom - top
-        width = right - left
-        if height < 6 or width < 4:
-            continue
-        ratio = width / max(height, 1)
-        if ratio < 0.15 or ratio > 2.2:
-            continue
-        mask = binary[top:bottom, left:right]
-        hproj = mask.sum(axis=1).astype(float)
-        vproj = mask.sum(axis=0).astype(float)
-        if hproj.max() == 0:
-            continue
-        h_threshold = max(1, int(hproj.max() * 0.42))
-        v_threshold = max(1, int(vproj.max() * 0.42))
-        h_runs = _count_runs(hproj >= h_threshold)
-        v_runs = _count_runs(vproj >= v_threshold)
-        dominant_column = int(np.argmax(vproj))
-        centered = width * 0.2 <= dominant_column <= width * 0.8
-        if not centered:
-            continue
-        # Three horizontal bars → unambiguous ±
-        if h_runs >= 3 and v_runs >= 1:
-            return (left + right) // 2
-        # Two bars ("+" part of ±, minus bar may be a separate component):
-        # require a strong central vertical-bar peak.  For ± the center column
-        # vproj is typically 2-4× the column average because the thin vertical
-        # bar runs through the full glyph height; round letters like "g"/"d"
-        # have a much flatter column distribution and are rejected here.
-        if h_runs == 2 and vproj.mean() > 0:
-            peak_ratio = float(vproj[dominant_column]) / float(vproj.mean())
-            if peak_ratio >= 1.8:
-                return (left + right) // 2
-    return None
-
-
-def _contains_plus_minus_symbol(image: Image.Image) -> bool:
-    return _plus_minus_glyph_x(image) is not None
 
 
 def _looks_like_noise(text: str) -> bool:
@@ -734,18 +956,6 @@ def _looks_like_noise(text: str) -> bool:
     if len(text) <= 2 and not any(char.isalnum() for char in text):
         return True
     return False
-
-
-def _count_runs(values: np.ndarray) -> int:
-    runs = 0
-    in_run = False
-    for value in values.tolist():
-        if value and not in_run:
-            runs += 1
-            in_run = True
-        elif not value:
-            in_run = False
-    return runs
 
 
 def _unique_preserve_order(values: list[int]) -> list[int]:
