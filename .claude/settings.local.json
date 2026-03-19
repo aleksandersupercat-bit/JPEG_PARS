@@ -1,10 +1,16 @@
 {
   "permissions": {
     "allow": [
+      "Read(*)",
+      "Edit(*)",
+      "Bash(git *)",
+      "Bash(npm *)",
       "Bash(python -m pytest tests/ -v)",
       "Bash(pip install:*)",
       "Bash(python -m unittest tests/test_template_parser.py -v)",
-      "Bash(grep -E \"^test|^---|-+$|Ran|OK|FAIL|ERROR\")"
+      "Bash(grep -E \"^test|^---|-+$|Ran|OK|FAIL|ERROR\")",
+      "Bash(python \"c:/pdf_ingest/JPEG_PARS/tests/test_template_parser.py\")",
+      "Bash(python -c \":*)"
     ]
   }
 }

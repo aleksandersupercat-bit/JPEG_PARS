@@ -598,11 +598,8 @@ class JpegParsApp(tk.Tk):
             x1 = self.template_offset_x + region.x1 * display_width
             y1 = self.template_offset_y + region.y1 * display_height
             canvas.create_rectangle(x0, y0, x1, y1, outline=region.color, fill=region.color, width=2, stipple="gray25")
-            # Draw label with a dark shadow then white text so it is readable
-            # against any background color without overlapping the border.
             lx, ly = x0 + 4, y0 + 4
-            canvas.create_text(lx + 1, ly + 1, text=region.name, fill="#000000", anchor="nw", font=("Segoe UI", 9, "bold"))
-            canvas.create_text(lx, ly, text=region.name, fill="white", anchor="nw", font=("Segoe UI", 9, "bold"))
+            canvas.create_text(lx, ly, text=region.name, fill="black", anchor="nw", font=("Segoe UI", 9, "bold"))
 
     def _refresh_region_tree(self) -> None:
         self.region_tree.delete(*self.region_tree.get_children())

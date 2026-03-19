@@ -502,9 +502,14 @@ def _extract_with_tesseract(image: Image.Image, ocr_config: OcrConfig) -> OcrExt
 
 
 def _postprocess_extraction(extraction: OcrExtraction, image: Image.Image) -> OcrExtraction:
-    text = normalize_ocr_text(extraction.text)
     if _contains_plus_minus_symbol(image):
-        text = _merge_plus_minus_tokens(text)
+        # Pass the raw text to _merge_plus_minus_tokens BEFORE normalize_ocr_text
+        # removes spaces. If Paddle skips ± and outputs "120 0.5", the space is
+        # the only separator available — normalize_ocr_text would collapse it to
+        # "1200.5" first, leaving nothing to merge on.
+        text = _merge_plus_minus_tokens(extraction.text)
+    else:
+        text = normalize_ocr_text(extraction.text)
     if _looks_like_noise(text):
         return OcrExtraction(text="", confidence=0.0)
     return OcrExtraction(text=text, confidence=extraction.confidence)
@@ -612,6 +617,8 @@ def _normalize_measurement_text(text: str) -> str:
         "Ф": "\u2300",
         "φ": "\u2300",
         "Ø": "\u2300",
+        # PP-OCRv3 misreads the diameter symbol ∅ as $ (circle + stroke confusion)
+        "$": "\u2300",
     }
     for source, target in replacements.items():
         normalized = normalized.replace(source, target)
@@ -635,26 +642,43 @@ def _contains_plus_minus_symbol(image: Image.Image) -> bool:
     binary = data < 128
     if not np.any(binary):
         return False
-    ys, xs = np.nonzero(binary)
-    top, bottom = ys.min(), ys.max() + 1
-    left, right = xs.min(), xs.max() + 1
-    mask = binary[top:bottom, left:right]
-    mask = ndimage.binary_dilation(mask, structure=np.ones((2, 2), dtype=bool))
-    height, width = mask.shape
-    if height < 6 or width < 4:
+    # Dilate vertically (5×1 kernel) to merge intra-glyph strokes separated by
+    # up to 2-pixel vertical gaps.  A purely vertical kernel leaves horizontal
+    # character spacing intact, so adjacent characters in a text line are never
+    # accidentally merged into the same labeled region.
+    merged = ndimage.binary_dilation(binary, structure=np.ones((5, 1), dtype=bool))
+    labeled, count = ndimage.label(merged)
+    if count == 0:
         return False
-    ratio = width / max(height, 1)
-    if ratio < 0.15 or ratio > 2.2:
-        return False
-    hproj = mask.sum(axis=1)
-    vproj = mask.sum(axis=0)
-    h_threshold = max(1, int(hproj.max() * 0.42))
-    v_threshold = max(1, int(vproj.max() * 0.42))
-    h_runs = _count_runs(hproj >= h_threshold)
-    v_runs = _count_runs(vproj >= v_threshold)
-    dominant_column = int(np.argmax(vproj))
-    centered = width * 0.2 <= dominant_column <= width * 0.8
-    return centered and ((h_runs >= 3 and v_runs >= 1) or (h_runs >= 2 and v_runs >= 2))
+    for component_idx in range(1, count + 1):
+        ys, xs = np.nonzero(labeled == component_idx)
+        if len(ys) < 12:
+            continue
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        left, right = int(xs.min()), int(xs.max()) + 1
+        height = bottom - top
+        width = right - left
+        if height < 6 or width < 4:
+            continue
+        ratio = width / max(height, 1)
+        if ratio < 0.15 or ratio > 2.2:
+            continue
+        # Analyze the ORIGINAL (undilated) binary within this bounding box so
+        # the gaps between ± horizontal bars are preserved in the projection.
+        mask = binary[top:bottom, left:right]
+        hproj = mask.sum(axis=1).astype(float)
+        vproj = mask.sum(axis=0).astype(float)
+        if hproj.max() == 0:
+            continue
+        h_threshold = max(1, int(hproj.max() * 0.42))
+        v_threshold = max(1, int(vproj.max() * 0.42))
+        h_runs = _count_runs(hproj >= h_threshold)
+        v_runs = _count_runs(vproj >= v_threshold)
+        dominant_column = int(np.argmax(vproj))
+        centered = width * 0.2 <= dominant_column <= width * 0.8
+        if centered and ((h_runs >= 3 and v_runs >= 1) or (h_runs >= 2 and v_runs >= 2)):
+            return True
+    return False
 
 
 def _looks_like_noise(text: str) -> bool:
