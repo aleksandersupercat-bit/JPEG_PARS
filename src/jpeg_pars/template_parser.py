@@ -138,6 +138,53 @@ def extract_region_text(image: Image.Image, region: TemplateRegion, ocr_config: 
     if cropped.width <= 2 or cropped.height <= 2:
         return OcrExtraction(text="", confidence=0.0), []
 
+    backend = _preferred_backend(ocr_config)
+    if backend == "paddle":
+        # PaddleOCR has its own text detection: pass the full region crop
+        # directly so the model can locate all text lines in one call.
+        # Splitting into thin line strips forces extreme rescaling inside
+        # PaddleOCR (e.g. a 12 px strip → 1888 px wide after limit_side_len
+        # upscaling), which is both slow and inaccurate.
+        all_candidates: list[OcrCandidate] = []
+
+        prepared = _prepare_paddle_image(cropped)
+        extraction = _extract_with_paddle(prepared, ocr_config)
+        if extraction.text:
+            all_candidates.append(OcrCandidate(
+                variant_name="gray",
+                backend="paddle",
+                text=extraction.text,
+                confidence=extraction.confidence,
+                score=score_candidate(extraction.text, extraction.confidence),
+            ))
+
+        # For vertically-elongated regions the text is likely written top-to-
+        # bottom or bottom-to-top.  Try both 90° rotations and keep whichever
+        # produces the highest score.
+        region_w = region.x1 - region.x0
+        region_h = region.y1 - region.y0
+        if region_h > region_w * 1.5:
+            for degrees, vname in [(90, "vertical_ccw"), (-90, "vertical_cw")]:
+                rotated = _prepare_paddle_image(cropped.rotate(degrees, expand=True))
+                ext_rot = _extract_with_paddle(rotated, ocr_config)
+                if ext_rot.text:
+                    all_candidates.append(OcrCandidate(
+                        variant_name=vname,
+                        backend="paddle",
+                        text=ext_rot.text,
+                        confidence=ext_rot.confidence,
+                        score=score_candidate(ext_rot.text, ext_rot.confidence),
+                    ))
+
+        if not all_candidates:
+            return OcrExtraction(text="", confidence=0.0), []
+        best = max(all_candidates, key=lambda c: c.score)
+        return (
+            OcrExtraction(text=best.text, confidence=best.confidence),
+            sorted(all_candidates, key=lambda c: c.score, reverse=True),
+        )
+
+    # Tesseract path: split into individual text lines first.
     inner = _crop_inner_border(cropped)
     lines = _split_text_lines(inner)
     if not lines:
@@ -229,20 +276,25 @@ def score_candidate(text: str, confidence: float) -> float:
 def _recognize_line(image: Image.Image, ocr_config: OcrConfig) -> tuple[OcrExtraction, list[OcrCandidate]]:
     candidates: list[OcrCandidate] = []
     backend = _preferred_backend(ocr_config)
-    for variant_name, variant in _preprocess_variants(image):
-        if backend == "paddle":
-            extraction = _extract_with_paddle(variant, ocr_config)
-            if extraction.text:
-                candidates.append(
-                    OcrCandidate(
-                        variant_name=variant_name,
-                        backend="paddle",
-                        text=extraction.text,
-                        confidence=extraction.confidence,
-                        score=score_candidate(extraction.text, extraction.confidence),
-                    )
+    if backend == "paddle":
+        # PaddleOCR works best on its native-resolution grayscale input.
+        # Upscaling (4-6×) balloons the image to >1400 px wide, which makes
+        # the detection model run 6× slower and gives no accuracy benefit.
+        # One call with minimal preprocessing is enough.
+        prepared = _prepare_paddle_image(image)
+        extraction = _extract_with_paddle(prepared, ocr_config)
+        if extraction.text:
+            candidates.append(
+                OcrCandidate(
+                    variant_name="gray",
+                    backend="paddle",
+                    text=extraction.text,
+                    confidence=extraction.confidence,
+                    score=score_candidate(extraction.text, extraction.confidence),
                 )
-        elif backend == "tesseract":
+            )
+    elif backend == "tesseract":
+        for variant_name, variant in _preprocess_variants(image):
             extraction = _extract_with_tesseract(variant, ocr_config)
             if extraction.text:
                 candidates.append(
@@ -297,12 +349,36 @@ def _prepare_base_image(image: Image.Image) -> Image.Image:
     gray = gray.resize((max(1, gray.width * upscale), max(1, gray.height * upscale)), Image.Resampling.LANCZOS)
     gray = gray.filter(ImageFilter.MedianFilter(size=3))
     gray = ImageEnhance.Sharpness(gray).enhance(2.4)
-    gray = _remove_long_lines(gray)
+    if gray.height > 100:
+        gray = _remove_long_lines(gray)
     return gray
 
 
 def _prepare_ocr_image(image: Image.Image) -> Image.Image:
     return _prepare_base_image(image)
+
+
+def _prepare_paddle_image(image: Image.Image) -> Image.Image:
+    """Minimal preprocessing for PaddleOCR.
+
+    PaddleOCR runs its own internal resize and normalisation before
+    detection/recognition, so there is no need to upscale 4-6× here.
+    Upscaling only makes the server-side detection model process a much
+    larger image (e.g. 1416×48 instead of 354×12), which is ~6× slower
+    with no accuracy gain.  We only strip the inner border and apply
+    autocontrast so the model gets clean, evenly-lit input.
+    """
+    inner = _crop_inner_border(image)
+    gray = ImageOps.autocontrast(inner.convert("L"))
+    # PaddleOCR's text detection needs a minimum side of ~32 px.
+    min_side = min(gray.size)
+    if min_side < 32:
+        scale = max(2, 32 // min_side + 1)
+        gray = gray.resize(
+            (max(1, gray.width * scale), max(1, gray.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+    return gray
 
 
 def _remove_long_lines(image: Image.Image) -> Image.Image:
@@ -483,21 +559,26 @@ def _get_paddle_engine(ocr_config: OcrConfig) -> object | None:
     if PaddleOCR is None:
         return None
     lang = _resolve_paddle_lang(ocr_config.languages)
+    version = getattr(ocr_config, "ocr_version", "PP-OCRv3") or "PP-OCRv3"
+    cache_key = f"{lang}:{version}"
     with PADDLE_ENGINE_LOCK:
-        if lang in PADDLE_ENGINE_CACHE:
-            return PADDLE_ENGINE_CACHE[lang]
+        if cache_key in PADDLE_ENGINE_CACHE:
+            return PADDLE_ENGINE_CACHE[cache_key]
+        kwargs: dict = dict(
+            lang=lang,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+        if version:
+            kwargs["ocr_version"] = version
         try:
-            engine = PaddleOCR(
-                lang=lang,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
+            engine = PaddleOCR(**kwargs)
         except Exception as exc:
-            PADDLE_INIT_ERRORS[lang] = f"{type(exc).__name__}: {exc}"
+            PADDLE_INIT_ERRORS[cache_key] = f"{type(exc).__name__}: {exc}"
             return None
-        PADDLE_INIT_ERRORS.pop(lang, None)
-        PADDLE_ENGINE_CACHE[lang] = engine
+        PADDLE_INIT_ERRORS.pop(cache_key, None)
+        PADDLE_ENGINE_CACHE[cache_key] = engine
         return engine
 
 
@@ -658,16 +739,15 @@ def _adaptive_threshold(gray: np.ndarray, block_size: int = 31, offset: int = 11
 def _ensure_ocr_ready(ocr_config: OcrConfig) -> None:
     if _get_paddle_engine(ocr_config) is not None:
         return
+    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{getattr(ocr_config, 'ocr_version', 'PP-OCRv3')}"
     if pytesseract is None:
-        lang = _resolve_paddle_lang(ocr_config.languages)
-        details = PADDLE_INIT_ERRORS.get(lang)
+        details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
             raise RuntimeError(f"PaddleOCR failed to initialize: {details}")
         raise RuntimeError("No OCR backend is installed. Install PaddleOCR or Tesseract.")
     resolved = resolve_tesseract_cmd(ocr_config.tesseract_cmd)
     if not resolved:
-        lang = _resolve_paddle_lang(ocr_config.languages)
-        details = PADDLE_INIT_ERRORS.get(lang)
+        details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
             raise RuntimeError(f"PaddleOCR failed to initialize: {details}")
         raise RuntimeError("No OCR backend is available. Install PaddleOCR or set tesseract.exe.")
@@ -676,14 +756,15 @@ def _ensure_ocr_ready(ocr_config: OcrConfig) -> None:
 
 def get_template_ocr_backend_info(ocr_config: OcrConfig) -> tuple[str, str]:
     if _get_paddle_engine(ocr_config) is not None:
-        return "paddle", "PaddleOCR"
-    lang = _resolve_paddle_lang(ocr_config.languages)
+        version = getattr(ocr_config, "ocr_version", "PP-OCRv3") or "PP-OCRv3"
+        return "paddle", f"PaddleOCR {version}"
+    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{getattr(ocr_config, 'ocr_version', 'PP-OCRv3')}"
     if pytesseract is not None and resolve_tesseract_cmd(ocr_config.tesseract_cmd):
-        details = PADDLE_INIT_ERRORS.get(lang)
+        details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
             return "tesseract", f"Tesseract fallback, Paddle init error: {details}"
         return "tesseract", "Tesseract fallback"
-    details = PADDLE_INIT_ERRORS.get(lang)
+    details = PADDLE_INIT_ERRORS.get(cache_key)
     if details:
         return "none", f"Paddle init error: {details}"
     return "none", "No OCR backend available"

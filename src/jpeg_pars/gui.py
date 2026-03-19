@@ -56,6 +56,7 @@ class JpegParsApp(tk.Tk):
 
         self.template_source_image: Image.Image | None = None
         self.template_source_path: Path | None = None
+        self.template_canvas_image: Image.Image | None = None  # overrides source when browsing parsed files
         self.template_regions: list[TemplateRegion] = []
         self.template_results: list[ParsedSheet] = []
         self.template_scale = 1.0
@@ -184,6 +185,7 @@ class JpegParsApp(tk.Tk):
         self.template_folder_var = tk.StringVar()
         self.template_export_var = tk.StringVar()
         self.template_ocr_lang_var = tk.StringVar(value="eng+rus")
+        self.template_ocr_version_var = tk.StringVar(value="PP-OCRv3")
         self.template_tesseract_var = tk.StringVar()
         self.template_recursive_var = tk.BooleanVar(value=False)
 
@@ -201,8 +203,19 @@ class JpegParsApp(tk.Tk):
         ttk.Button(top_controls, text="Экспорт в Excel", command=self._export_template_results).grid(row=2, column=2, pady=(8, 0))
         ttk.Button(top_controls, text="Сохранить шаблон", command=self._save_template_file).grid(row=2, column=3, padx=(8, 0), pady=(8, 0))
 
-        ttk.Label(top_controls, text="Языки OCR").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(top_controls, textvariable=self.template_ocr_lang_var, width=20).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+        ocr_row = ttk.Frame(top_controls)
+        ocr_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(ocr_row, text="Языки OCR").pack(side="left")
+        ttk.Entry(ocr_row, textvariable=self.template_ocr_lang_var, width=14).pack(side="left", padx=(8, 20))
+        ttk.Label(ocr_row, text="Версия модели").pack(side="left")
+        ttk.Combobox(
+            ocr_row,
+            textvariable=self.template_ocr_version_var,
+            values=("PP-OCRv3", "PP-OCRv4", "PP-OCRv5"),
+            state="readonly",
+            width=12,
+        ).pack(side="left", padx=8)
+        ttk.Label(ocr_row, text="  PP-OCRv3 — быстро (≈20мс/регион)   PP-OCRv5 — точнее (≈420мс/регион)", foreground="#666666").pack(side="left")
 
         ttk.Label(top_controls, text="Путь к tesseract.exe").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top_controls, textvariable=self.template_tesseract_var, width=88).grid(row=4, column=1, sticky="ew", padx=8, pady=(8, 0))
@@ -263,6 +276,7 @@ class JpegParsApp(tk.Tk):
         self.region_tree.pack(fill="both", expand=True)
         self.region_tree.bind("<Double-1>", self._edit_region_name)
         self.region_tree.bind("<<TreeviewSelect>>", self._on_region_tree_select)
+        self.region_tree.bind("<Delete>", lambda _: self._delete_selected_region())
 
         self.results_tree = ttk.Treeview(results_frame, show="headings")
         self.results_tree.pack(fill="both", expand=True)
@@ -384,6 +398,7 @@ class JpegParsApp(tk.Tk):
             return
         self.template_source_path = Path(path)
         self.template_source_image = Image.open(path).convert("RGB")
+        self.template_canvas_image = None
         self.template_zoom = 1.0
         self.template_manual_pan = False
         self.template_preview_cache_key = None
@@ -421,6 +436,7 @@ class JpegParsApp(tk.Tk):
         image_path, regions = load_template(Path(path))
         self.template_regions = regions
         self.template_results.clear()
+        self.template_canvas_image = None
         if image_path and image_path.exists():
             self.template_source_path = image_path
             self.template_source_image = Image.open(image_path).convert("RGB")
@@ -548,13 +564,16 @@ class JpegParsApp(tk.Tk):
 
         canvas_width = max(canvas.winfo_width(), 100)
         canvas_height = max(canvas.winfo_height(), 100)
-        image = self.template_source_image.copy()
+        # Use the parsed-file preview when a result row is selected;
+        # fall back to the template source otherwise.
+        display_image = self.template_canvas_image or self.template_source_image
+        image = display_image.copy()
         base_scale = min((canvas_width - 20) / image.width, (canvas_height - 20) / image.height)
         scale = base_scale * self.template_zoom
         scale = max(scale, 0.05)
         display_width = max(1, int(image.width * scale))
         display_height = max(1, int(image.height * scale))
-        cache_key = (id(self.template_source_image), display_width, display_height)
+        cache_key = (id(display_image), display_width, display_height)
         if self.template_preview_image is None or self.template_preview_cache_key != cache_key:
             resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
             self.template_preview_image = ImageTk.PhotoImage(resized)
@@ -579,7 +598,11 @@ class JpegParsApp(tk.Tk):
             x1 = self.template_offset_x + region.x1 * display_width
             y1 = self.template_offset_y + region.y1 * display_height
             canvas.create_rectangle(x0, y0, x1, y1, outline=region.color, fill=region.color, width=2, stipple="gray25")
-            canvas.create_text(x0 + 8, y0 + 8, text=region.name, fill=region.color, anchor="nw", font=("Segoe UI", 10, "bold"))
+            # Draw label with a dark shadow then white text so it is readable
+            # against any background color without overlapping the border.
+            lx, ly = x0 + 4, y0 + 4
+            canvas.create_text(lx + 1, ly + 1, text=region.name, fill="#000000", anchor="nw", font=("Segoe UI", 9, "bold"))
+            canvas.create_text(lx, ly, text=region.name, fill="white", anchor="nw", font=("Segoe UI", 9, "bold"))
 
     def _refresh_region_tree(self) -> None:
         self.region_tree.delete(*self.region_tree.get_children())
@@ -636,6 +659,7 @@ class JpegParsApp(tk.Tk):
     def _clear_regions(self) -> None:
         self.template_regions.clear()
         self.template_results.clear()
+        self.template_canvas_image = None
         self._refresh_region_tree()
         self._refresh_results_tree()
         self._render_template_canvas()
@@ -665,6 +689,7 @@ class JpegParsApp(tk.Tk):
                 tesseract_cmd=self.template_tesseract_var.get().strip() or None,
                 languages=self.template_ocr_lang_var.get().strip() or "eng+rus",
                 psm=6,
+                ocr_version=self.template_ocr_version_var.get().strip() or "PP-OCRv3",
             )
             backend, backend_message = get_template_ocr_backend_info(ocr_config)
             if backend == "none":
@@ -705,8 +730,20 @@ class JpegParsApp(tk.Tk):
         self._refresh_debug_tree()
 
     def _on_result_row_select(self, _: object) -> None:
+        selected = self.results_tree.selection()
+        if selected:
+            index = self.results_tree.index(selected[0])
+            if 0 <= index < len(self.template_results):
+                file_path = self.template_results[index].file_path
+                try:
+                    self.template_canvas_image = Image.open(file_path).convert("RGB")
+                    self.template_preview_cache_key = None
+                    self.template_preview_image = None
+                except Exception:
+                    self.template_canvas_image = None
         self._refresh_region_tree()
         self._refresh_debug_tree()
+        self._render_template_canvas()
 
     def _get_selected_template_result(self) -> ParsedSheet | None:
         selected = self.results_tree.selection()

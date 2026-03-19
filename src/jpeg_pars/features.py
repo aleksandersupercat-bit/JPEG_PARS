@@ -29,6 +29,7 @@ class OcrConfig:
     tesseract_cmd: str | None = None
     languages: str = "eng+rus"
     psm: int = 6
+    ocr_version: str = "PP-OCRv3"
 
 
 @dataclass(slots=True)
