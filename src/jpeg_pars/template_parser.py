@@ -110,6 +110,36 @@ _PM_LOOKALIKES: dict[str, str] = {
 }
 
 
+def _fuse_pm(paddle_text: str, tess_text: str) -> str | None:
+    """Cross-engine ± recovery.
+
+    Paddle often silently drops ±; Tesseract reads it as a lookalike char
+    (most commonly '7', sometimes '1', '+', 'I').
+
+    If tess_text is exactly 1 char longer than paddle_text, and there exists
+    a position where:
+      - tess_text[i] is a known ± lookalike, AND
+      - removing that char gives exactly paddle_text,
+    then the char at position i was ± → return the fused string with ±.
+
+    Example:  paddle='4345'  tess='43475'
+      → tess[3]='7' is lookalike, remove → '4345' == paddle → '434±5'
+    """
+    if not paddle_text or not tess_text:
+        return None
+    if len(tess_text) != len(paddle_text) + 1:
+        return None
+    for i, c in enumerate(tess_text):
+        if c in _PM_LOOKALIKES:
+            without = tess_text[:i] + tess_text[i + 1:]
+            if without == paddle_text:
+                fused = paddle_text[:i] + "\u00b1" + paddle_text[i:]
+                _LOG.debug("      fuse_pm: paddle=%r tess=%r char=%r@%d → %r",
+                           paddle_text, tess_text, c, i, fused)
+                return fused
+    return None
+
+
 def _log_char_analysis(region_name: str, raw_words: list["OcrCandidate"], final_text: str) -> None:
     """Log per-character breakdown — focus on where ± might have been lost."""
     if not _LOG.isEnabledFor(logging.DEBUG):
@@ -331,6 +361,23 @@ def extract_region_text(
                 confidence=tess_extraction.confidence,
                 score=score_candidate(tess_extraction.text, tess_extraction.confidence),
             ))
+
+        # Cross-engine fusion: if Paddle dropped ± and Tesseract read it as
+        # a lookalike character, reconstruct the correct string.
+        if extraction.text and tess_extraction.text:
+            fused = _fuse_pm(extraction.text, tess_extraction.text)
+            if fused:
+                fused_conf = max(extraction.confidence, tess_extraction.confidence)
+                fused_score = score_candidate(fused, fused_conf)
+                _LOG.debug("   [%s] fused candidate: %s  score=(%.1f)",
+                           region.name, _repr_text(fused), fused_score)
+                all_candidates.append(OcrCandidate(
+                    variant_name="fused",
+                    backend="fusion",
+                    text=fused,
+                    confidence=fused_conf,
+                    score=fused_score,
+                ))
 
         if not all_candidates:
             _LOG.debug("   [%s] no candidates → empty", region.name)
