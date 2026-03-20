@@ -7,6 +7,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from .template_parser import (
@@ -21,8 +22,8 @@ from .template_parser import (
     get_template_ocr_backend_info,
     load_template,
     materialize_groups,
+    _open_image,
     parse_template_batch,
-    resolve_tesseract_cmd,
     save_template,
 )
 
@@ -90,9 +91,9 @@ class JpegParsApp(tk.Tk):
         self.template_draw_mode = False
         self.template_drag_start: tuple[int, int] | None = None
         self.template_drag_item: int | None = None
+        self.template_hq_render_job: str | None = None
 
         self._build_ui()
-        self._autofill_tesseract_path()
         self.after(120, self._poll_worker_queue)
 
     def _build_ui(self) -> None:
@@ -153,15 +154,6 @@ class JpegParsApp(tk.Tk):
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
-    def _autofill_tesseract_path(self) -> None:
-        resolved = resolve_tesseract_cmd()
-        if not resolved:
-            return
-        if not self.group_tesseract_var.get():
-            self.group_tesseract_var.set(resolved)
-        if not self.template_tesseract_var.get():
-            self.template_tesseract_var.set(resolved)
-
     def _build_grouping_tab(self, parent: ttk.Frame) -> None:
         controls = ttk.LabelFrame(parent, text="Параметры группировки", padding=12)
         controls.pack(fill="x")
@@ -171,9 +163,8 @@ class JpegParsApp(tk.Tk):
         self.group_similarity_var = tk.IntVar(value=82)
         self.group_recursive_var = tk.BooleanVar(value=False)
         self.group_mode_var = tk.StringVar(value="copy")
-        self.group_ocr_mode_var = tk.StringVar(value="auto")
+        self.group_ocr_mode_var = tk.StringVar(value="off")
         self.group_ocr_lang_var = tk.StringVar(value="eng+rus")
-        self.group_tesseract_var = tk.StringVar()
 
         ttk.Label(controls, text="Папка с JPEG").grid(row=0, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.group_input_var, width=90).grid(row=0, column=1, sticky="ew", padx=8)
@@ -205,16 +196,12 @@ class JpegParsApp(tk.Tk):
         ttk.Label(controls, text="Языки OCR").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(controls, textvariable=self.group_ocr_lang_var, width=20).grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
 
-        ttk.Label(controls, text="Путь к Tesseract").grid(row=5, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(controls, textvariable=self.group_tesseract_var, width=90).grid(row=5, column=1, sticky="ew", padx=8, pady=(8, 0))
-        ttk.Button(controls, text="Выбрать", command=self._choose_tesseract_for_grouping).grid(row=5, column=2, padx=4, pady=(8, 0))
-
-        ttk.Checkbutton(controls, text="Рекурсивно искать JPEG", variable=self.group_recursive_var).grid(row=6, column=0, sticky="w", pady=(10, 0))
-        ttk.Radiobutton(controls, text="Копировать", variable=self.group_mode_var, value="copy").grid(row=6, column=1, sticky="w", pady=(10, 0))
-        ttk.Radiobutton(controls, text="Перемещать", variable=self.group_mode_var, value="move").grid(row=6, column=1, sticky="w", padx=(120, 0), pady=(10, 0))
+        ttk.Checkbutton(controls, text="Рекурсивно искать JPEG", variable=self.group_recursive_var).grid(row=5, column=0, sticky="w", pady=(10, 0))
+        ttk.Radiobutton(controls, text="Копировать", variable=self.group_mode_var, value="copy").grid(row=5, column=1, sticky="w", pady=(10, 0))
+        ttk.Radiobutton(controls, text="Перемещать", variable=self.group_mode_var, value="move").grid(row=5, column=1, sticky="w", padx=(120, 0), pady=(10, 0))
 
         self.group_start_button = ttk.Button(controls, text="Запустить группировку", command=self._start_grouping)
-        self.group_start_button.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.group_start_button.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         controls.columnconfigure(1, weight=1)
 
         result_pane = ttk.PanedWindow(parent, orient="horizontal")
@@ -252,7 +239,6 @@ class JpegParsApp(tk.Tk):
         self.template_export_var = tk.StringVar()
         self.template_ocr_lang_var = tk.StringVar(value="eng+rus")
         self.template_ocr_version_var = tk.StringVar(value="PP-OCRv3")
-        self.template_tesseract_var = tk.StringVar()
         self.template_recursive_var = tk.BooleanVar(value=False)
 
         ttk.Label(top_controls, text="Шаблон JPEG").grid(row=0, column=0, sticky="w")
@@ -283,12 +269,8 @@ class JpegParsApp(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Label(ocr_row, text="  PP-OCRv3 — быстрый; для ± включается точечная проверка через PP-OCRv5", foreground="#666666").pack(side="left")
 
-        ttk.Label(top_controls, text="Путь к Tesseract").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(top_controls, textvariable=self.template_tesseract_var, width=88).grid(row=4, column=1, sticky="ew", padx=8, pady=(8, 0))
-        ttk.Button(top_controls, text="Выбрать", command=self._choose_tesseract_for_template).grid(row=4, column=2, pady=(8, 0))
-
         button_bar = ttk.Frame(top_controls)
-        button_bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        button_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         self.template_add_region_button = ttk.Button(button_bar, text="Выбрать границы поиска", command=self._enable_template_draw_mode)
         self.template_add_region_button.pack(side="left")
         ttk.Button(button_bar, text="Удалить метку", command=self._delete_selected_region).pack(side="left", padx=8)
@@ -380,16 +362,6 @@ class JpegParsApp(tk.Tk):
         if folder:
             self.group_output_var.set(folder)
 
-    def _choose_tesseract_for_grouping(self) -> None:
-        path = filedialog.askopenfilename(title="Выберите Tesseract (.exe в папке установки)", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
-        if path:
-            self.group_tesseract_var.set(path)
-
-    def _choose_tesseract_for_template(self) -> None:
-        path = filedialog.askopenfilename(title="Выберите Tesseract (.exe в папке установки)", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
-        if path:
-            self.template_tesseract_var.set(path)
-
     def _start_grouping(self) -> None:
         input_value = self.group_input_var.get().strip()
         output_value = self.group_output_var.get().strip()
@@ -414,7 +386,7 @@ class JpegParsApp(tk.Tk):
         try:
             ocr_config = OcrConfig(
                 mode=self.group_ocr_mode_var.get(),
-                tesseract_cmd=self.group_tesseract_var.get().strip() or None,
+                tesseract_cmd=None,
                 languages=self.group_ocr_lang_var.get().strip() or "eng+rus",
                 psm=6,
             )
@@ -449,7 +421,7 @@ class JpegParsApp(tk.Tk):
         canvas = self.group_preview_canvas
         width = max(canvas.winfo_width(), 300)
         height = max(canvas.winfo_height(), 300)
-        image = Image.open(path).convert("RGB")
+        image = _open_image(Path(path)).convert("RGB")
         image.thumbnail((width - 20, height - 20), Image.Resampling.LANCZOS)
         self.group_preview_image = ImageTk.PhotoImage(image)
         canvas.delete("all")
@@ -463,7 +435,7 @@ class JpegParsApp(tk.Tk):
         if not path:
             return
         self.template_source_path = Path(path)
-        self.template_source_image = Image.open(path).convert("RGB")
+        self.template_source_image = _open_image(Path(path)).convert("RGB")
         self.template_canvas_image = None
         self.template_zoom = 1.0
         self.template_manual_pan = False
@@ -474,7 +446,7 @@ class JpegParsApp(tk.Tk):
         self.template_results.clear()
         self._refresh_region_tree()
         self._refresh_results_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
         self.template_status_var.set("Шаблон загружен. Можно размечать области поиска.")
 
     def _save_template_file(self) -> None:
@@ -505,7 +477,7 @@ class JpegParsApp(tk.Tk):
         self.template_canvas_image = None
         if image_path and image_path.exists():
             self.template_source_path = image_path
-            self.template_source_image = Image.open(image_path).convert("RGB")
+            self.template_source_image = _open_image(image_path).convert("RGB")
             self.template_image_var.set(str(image_path))
             self.template_zoom = 1.0
             self.template_manual_pan = False
@@ -513,7 +485,7 @@ class JpegParsApp(tk.Tk):
             self.template_preview_image = None
         self._refresh_region_tree()
         self._refresh_results_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
         self.template_status_var.set(f"Шаблон загружен: {path}")
 
     def _choose_template_folder(self) -> None:
@@ -531,15 +503,27 @@ class JpegParsApp(tk.Tk):
         self.template_status_var.set("Нарисуйте прямоугольник поверх изображения.")
 
     def _on_template_canvas_resize(self, _: object) -> None:
-        self._render_template_canvas()
+        self._schedule_template_render()
 
     def _on_template_mousewheel(self, event: tk.Event[tk.Misc]) -> None:
         if self.template_source_image is None:
             return
+        canvas_width = max(self.template_canvas.winfo_width(), 100)
+        canvas_height = max(self.template_canvas.winfo_height(), 100)
+        display_image = self.template_canvas_image or self.template_source_image
+        base_scale = min((canvas_width - 20) / display_image.width, (canvas_height - 20) / display_image.height)
+        old_scale = max(base_scale * self.template_zoom, 0.05)
         factor = 1.1 if event.delta > 0 else 0.9
-        self.template_zoom = min(8.0, max(0.2, self.template_zoom * factor))
+        new_zoom = min(8.0, max(0.2, self.template_zoom * factor))
+        new_scale = max(base_scale * new_zoom, 0.05)
+        if old_scale > 0:
+            rel_x = (event.x - self.template_offset_x) / old_scale
+            rel_y = (event.y - self.template_offset_y) / old_scale
+            self.template_offset_x = int(event.x - rel_x * new_scale)
+            self.template_offset_y = int(event.y - rel_y * new_scale)
+        self.template_zoom = new_zoom
         self.template_manual_pan = True
-        self._render_template_canvas()
+        self._schedule_template_render(lock_pan=True, fast=True)
 
     def _on_template_pan_start(self, event: tk.Event[tk.Misc]) -> None:
         if self.template_source_image is None:
@@ -554,7 +538,7 @@ class JpegParsApp(tk.Tk):
         self.template_offset_x += event.x - previous_x
         self.template_offset_y += event.y - previous_y
         self.template_pan_start = (event.x, event.y)
-        self._render_template_canvas(lock_pan=True)
+        self._schedule_template_render(lock_pan=True, fast=True)
 
     def _on_template_pan_end(self, _: tk.Event[tk.Misc]) -> None:
         self.template_pan_start = None
@@ -595,7 +579,7 @@ class JpegParsApp(tk.Tk):
             return
         self.template_regions.append(region)
         self._refresh_region_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
         self.template_status_var.set(f"Добавлена область {region.name}.")
 
     def _region_from_canvas_points(self, x0: int, y0: int, x1: int, y1: int) -> TemplateRegion | None:
@@ -622,7 +606,15 @@ class JpegParsApp(tk.Tk):
             y1=max(0.0, min(1.0, ny1)),
         )
 
-    def _render_template_canvas(self, lock_pan: bool = False) -> None:
+    def _schedule_template_render(self, lock_pan: bool = False, fast: bool = False) -> None:
+        self._render_template_canvas(lock_pan=lock_pan, high_quality=not fast)
+        if self.template_hq_render_job is not None:
+            self.after_cancel(self.template_hq_render_job)
+            self.template_hq_render_job = None
+        if fast:
+            self.template_hq_render_job = self.after(90, lambda: self._render_template_canvas(lock_pan=lock_pan, high_quality=True))
+
+    def _render_template_canvas(self, lock_pan: bool = False, high_quality: bool = True) -> None:
         canvas = self.template_canvas
         canvas.delete("all")
         if self.template_source_image is None:
@@ -633,17 +625,12 @@ class JpegParsApp(tk.Tk):
         # Use the parsed-file preview when a result row is selected;
         # fall back to the template source otherwise.
         display_image = self.template_canvas_image or self.template_source_image
-        image = display_image.copy()
+        image = display_image
         base_scale = min((canvas_width - 20) / image.width, (canvas_height - 20) / image.height)
         scale = base_scale * self.template_zoom
         scale = max(scale, 0.05)
         display_width = max(1, int(image.width * scale))
         display_height = max(1, int(image.height * scale))
-        cache_key = (id(display_image), display_width, display_height)
-        if self.template_preview_image is None or self.template_preview_cache_key != cache_key:
-            resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
-            self.template_preview_image = ImageTk.PhotoImage(resized)
-            self.template_preview_cache_key = cache_key
 
         self.template_scale = scale
         self.template_display_width = display_width
@@ -657,7 +644,30 @@ class JpegParsApp(tk.Tk):
             self.template_offset_x = min(20, max(min_x, self.template_offset_x))
             self.template_offset_y = min(20, max(min_y, self.template_offset_y))
 
-        canvas.create_image(self.template_offset_x, self.template_offset_y, image=self.template_preview_image, anchor="nw")
+        visible_x0 = max(0, self.template_offset_x)
+        visible_y0 = max(0, self.template_offset_y)
+        visible_x1 = min(canvas_width, self.template_offset_x + display_width)
+        visible_y1 = min(canvas_height, self.template_offset_y + display_height)
+        if visible_x1 > visible_x0 and visible_y1 > visible_y0:
+            src_x0 = max(0.0, (visible_x0 - self.template_offset_x) / scale)
+            src_y0 = max(0.0, (visible_y0 - self.template_offset_y) / scale)
+            src_x1 = min(float(image.width), (visible_x1 - self.template_offset_x) / scale)
+            src_y1 = min(float(image.height), (visible_y1 - self.template_offset_y) / scale)
+            crop_box = (
+                int(src_x0),
+                int(src_y0),
+                max(int(src_x0) + 1, int(np.ceil(src_x1))),
+                max(int(src_y0) + 1, int(np.ceil(src_y1))),
+            )
+            output_size = (max(1, int(round((crop_box[2] - crop_box[0]) * scale))), max(1, int(round((crop_box[3] - crop_box[1]) * scale))))
+            cache_key = (id(display_image), crop_box, output_size, 1 if high_quality else 0)
+            if self.template_preview_image is None or self.template_preview_cache_key != cache_key:
+                resample = Image.Resampling.LANCZOS if high_quality else Image.Resampling.BILINEAR
+                cropped = image.crop(crop_box)
+                resized = cropped.resize(output_size, resample)
+                self.template_preview_image = ImageTk.PhotoImage(resized)
+                self.template_preview_cache_key = cache_key
+            canvas.create_image(visible_x0, visible_y0, image=self.template_preview_image, anchor="nw")
         for region in self.template_regions:
             x0 = self.template_offset_x + region.x0 * display_width
             y0 = self.template_offset_y + region.y0 * display_height
@@ -707,7 +717,7 @@ class JpegParsApp(tk.Tk):
         )
         self._refresh_region_tree()
         self._refresh_results_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
 
     def _delete_selected_region(self) -> None:
         selected = self.region_tree.selection()
@@ -717,7 +727,7 @@ class JpegParsApp(tk.Tk):
         self.template_regions.pop(index)
         self._refresh_region_tree()
         self._refresh_results_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
 
     def _clear_regions(self) -> None:
         self.template_regions.clear()
@@ -725,7 +735,7 @@ class JpegParsApp(tk.Tk):
         self.template_canvas_image = None
         self._refresh_region_tree()
         self._refresh_results_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
         self._refresh_debug_tree()
 
     def _start_template_parsing(self) -> None:
@@ -749,7 +759,7 @@ class JpegParsApp(tk.Tk):
         try:
             ocr_config = OcrConfig(
                 mode="required",
-                tesseract_cmd=self.template_tesseract_var.get().strip() or None,
+                tesseract_cmd=None,
                 languages=self.template_ocr_lang_var.get().strip() or "eng+rus",
                 psm=6,
                 ocr_version=self.template_ocr_version_var.get().strip() or "PP-OCRv3",
@@ -799,14 +809,14 @@ class JpegParsApp(tk.Tk):
             if 0 <= index < len(self.template_results):
                 file_path = self.template_results[index].file_path
                 try:
-                    self.template_canvas_image = Image.open(file_path).convert("RGB")
+                    self.template_canvas_image = _open_image(file_path).convert("RGB")
                     self.template_preview_cache_key = None
                     self.template_preview_image = None
                 except Exception:
                     self.template_canvas_image = None
         self._refresh_region_tree()
         self._refresh_debug_tree()
-        self._render_template_canvas()
+        self._schedule_template_render()
 
     def _get_selected_template_result(self) -> ParsedSheet | None:
         selected = self.results_tree.selection()

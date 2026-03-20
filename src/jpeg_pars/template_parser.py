@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import json
 import logging
@@ -11,6 +12,7 @@ import string
 import threading
 import time
 import unicodedata
+import warnings
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +24,7 @@ from scipy import ndimage
 from scipy.fft import dctn
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+warnings.filterwarnings("ignore", message=".*urllib3.*doesn't match a supported version.*")
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg"}
 TOKEN_PATTERN = re.compile(r"[A-ZРЂ-Я0-9]{2,}")
@@ -33,6 +36,23 @@ _COMMON_TESSERACT_ROOTS = [
     Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR",
 ]
 _RIL_WORD = 3
+
+
+@contextlib.contextmanager
+def _suppress_native_output() -> object:
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+        os.close(devnull_fd)
 
 
 @dataclass(slots=True)
@@ -77,8 +97,15 @@ class TesseractWord:
     width: int
     height: int
 
+def _open_image(path: Path) -> Image.Image:
+    with _suppress_native_output():
+        image = Image.open(path)
+        image.load()
+    return image
+
 try:
-    from paddleocr import PaddleOCR
+    with _suppress_native_output():
+        from paddleocr import PaddleOCR
 except ImportError:
     PaddleOCR = None
 
@@ -351,7 +378,7 @@ def parse_template_batch(
     results: list[ParsedSheet] = []
     for path in files:
         t_file = time.perf_counter()
-        image = Image.open(path).convert("RGB")
+        image = _open_image(path).convert("RGB")
         _LOG.info("── FILE: %s  size=%dx%d", path.name, image.width, image.height)
         values: dict[str, str] = {}
         confidences: dict[str, float] = {}
@@ -812,13 +839,14 @@ def _precompute_full_page_paddle(image: Image.Image, ocr_config: OcrConfig) -> o
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     paddle_input = np.asarray(img)
     try:
-        result = engine.predict(
-            paddle_input,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            text_rec_score_thresh=0.0,
-        )
+        with _suppress_native_output():
+            result = engine.predict(
+                paddle_input,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_rec_score_thresh=0.0,
+            )
         return {"result": result, "scale": scale}
     except Exception:
         return None
@@ -927,13 +955,14 @@ def _extract_with_paddle(
         return OcrExtraction(text="", confidence=0.0)
     paddle_input = np.asarray(image.convert("RGB"))
     try:
-        result = engine.predict(
-            paddle_input,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            text_rec_score_thresh=0.0,
-        )
+        with _suppress_native_output():
+            result = engine.predict(
+                paddle_input,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_rec_score_thresh=0.0,
+            )
     except Exception:
         return OcrExtraction(text="", confidence=0.0)
     extraction = _parse_paddle_result(result)
@@ -1059,7 +1088,8 @@ def _get_paddle_engine(ocr_config: OcrConfig, force_version: str | None = None) 
         if version:
             kwargs["ocr_version"] = version
         try:
-            engine = PaddleOCR(**kwargs)
+            with _suppress_native_output():
+                engine = PaddleOCR(**kwargs)
         except Exception as exc:
             PADDLE_INIT_ERRORS[cache_key] = f"{type(exc).__name__}: {exc}"
             return None
@@ -1580,7 +1610,7 @@ def _extract_ocr_features(image: Image.Image, ocr_config: OcrConfig | None) -> t
 
 
 def load_features(path: Path, ocr_config: OcrConfig | None = None) -> ImageFeatures:
-    image = Image.open(path).convert("L")
+    image = _open_image(path).convert("L")
     normalized = _normalize_image(image)
     binary = _binary_map(normalized)
     edge_map = _edge_map(normalized)
