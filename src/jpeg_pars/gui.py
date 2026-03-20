@@ -278,7 +278,7 @@ class JpegParsApp(tk.Tk):
             state="readonly",
             width=12,
         ).pack(side="left", padx=8)
-        ttk.Label(ocr_row, text="  PP-OCRv3 — быстро (≈20мс/регион)   PP-OCRv5 — точнее (≈420мс/регион)", foreground="#666666").pack(side="left")
+        ttk.Label(ocr_row, text="  PP-OCRv3 — быстрый; для ± включается точечная проверка через PP-OCRv5", foreground="#666666").pack(side="left")
 
         ttk.Label(top_controls, text="Путь к tesseract.exe").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top_controls, textvariable=self.template_tesseract_var, width=88).grid(row=4, column=1, sticky="ew", padx=8, pady=(8, 0))

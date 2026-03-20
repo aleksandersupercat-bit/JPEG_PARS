@@ -20,8 +20,11 @@ from jpeg_pars.template_parser import (
     ParsedSheet,
     TemplateRegion,
     _contains_plus_minus_symbol,
+    _inject_pm_sentinel,
     _merge_plus_minus_tokens,
     _prepare_base_image,
+    _resolve_paddle_lang,
+    _should_recheck_plus_minus_with_paddle_v5,
     _psm_candidates,
     _remove_long_lines,
     default_region_name,
@@ -103,6 +106,30 @@ class TemplateParserTests(unittest.TestCase):
         self.assertIn(5, candidates)
         self.assertIn(11, candidates)
         self.assertIn(13, candidates)
+
+    def test_resolve_paddle_lang_keeps_russian_only_as_ru(self) -> None:
+        self.assertEqual(_resolve_paddle_lang("rus"), "ru")
+        self.assertEqual(_resolve_paddle_lang("ru"), "ru")
+        self.assertEqual(_resolve_paddle_lang("eng+rus"), "en")
+
+    def test_should_recheck_plus_minus_with_paddle_v5_when_tesseract_found_pm(self) -> None:
+        from jpeg_pars.template_parser import OcrExtraction
+        self.assertTrue(_should_recheck_plus_minus_with_paddle_v5(
+            OcrConfig(languages="eng", ocr_version="PP-OCRv3"),
+            OcrExtraction(text="8610%kg", confidence=98.0),
+            OcrExtraction(text="86±10%kg", confidence=35.0),
+        ))
+
+    def test_inject_pm_sentinel_marks_suspect_gap(self) -> None:
+        self.assertEqual(_inject_pm_sentinel("8610%kg", "86±10%kg"), "86<PM?>10%kg")
+
+    def test_should_not_recheck_plus_minus_with_paddle_v5_for_pm_capable_model(self) -> None:
+        from jpeg_pars.template_parser import OcrExtraction
+        self.assertFalse(_should_recheck_plus_minus_with_paddle_v5(
+            OcrConfig(languages="eng", ocr_version="PP-OCRv5"),
+            OcrExtraction(text="8610%kg", confidence=98.0),
+            OcrExtraction(text="86±10%kg", confidence=35.0),
+        ))
 
     def test_merge_plus_minus_tokens_rebuilds_measurement(self) -> None:
         self.assertEqual(_merge_plus_minus_tokens("434+5"), "434±5")

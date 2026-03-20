@@ -70,15 +70,16 @@ def _repr_text(text: str) -> str:
 
 def _score_breakdown(text: str, confidence: float) -> str:
     """Return a human-readable score breakdown string."""
-    dim_match = any(p.match(text) for p in DIMENSION_PATTERNS)
-    pm_bonus = 15.0 if "\u00b1" in text else 0.0
+    scored_text = text.replace(_PM_SENTINEL, "\u00b1")
+    dim_match = any(p.match(scored_text) for p in DIMENSION_PATTERNS)
+    pm_bonus = 15.0 if _contains_pm_marker(text) else 0.0
     pct_bonus = 8.0 if "%" in text else 0.0
     digit_bonus = sum(c.isdigit() for c in text) * 1.2
     bad_chars = sum(
         1 for c in text
         if c not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
         "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-        "\u00b1\u2300\u00d8\u03c6%.-"
+        "\u00b1\u2300\u00d8\u03c6%.-<>PM?"
     )
     bad_penalty = bad_chars * 6.0
     total = confidence + (40.0 if dim_match else 0.0) + pm_bonus + pct_bonus + digit_bonus - bad_penalty
@@ -140,6 +141,38 @@ def _fuse_pm(paddle_text: str, tess_text: str) -> str | None:
     return None
 
 
+def _contains_pm_marker(text: str) -> bool:
+    return "\u00b1" in text or _PM_SENTINEL in text
+
+
+def _split_joined_tolerance(text: str) -> tuple[str, str, str] | None:
+    match = re.match(r"^([\u2300\u00d8\u03c6]?)(\d{3,6})(%[A-Za-z]{0,4}|[A-Za-z]{1,4}|%)?$", text)
+    if match:
+        prefix, digits, suffix = match.groups()
+        tol_len = 2 if len(digits) >= 4 else 1
+        nominal = digits[:-tol_len]
+        tolerance = digits[-tol_len:]
+        if len(nominal) >= 2:
+            return prefix + nominal, tolerance, suffix or ""
+    return None
+
+
+def _inject_pm_sentinel(paddle_text: str, tess_text: str = "") -> str | None:
+    if not paddle_text or _contains_pm_marker(paddle_text):
+        return None
+    if tess_text:
+        if "\u00b1" in tess_text and tess_text.replace("\u00b1", "") == paddle_text:
+            return tess_text.replace("\u00b1", _PM_SENTINEL)
+        fused = _fuse_pm(paddle_text, tess_text)
+        if fused:
+            return fused.replace("\u00b1", _PM_SENTINEL)
+    split = _split_joined_tolerance(paddle_text)
+    if not split:
+        return None
+    left, tolerance, suffix = split
+    return f"{left}{_PM_SENTINEL}{tolerance}{suffix}"
+
+
 def _log_char_analysis(region_name: str, raw_words: list["OcrCandidate"], final_text: str) -> None:
     """Log per-character breakdown — focus on where ± might have been lost."""
     if not _LOG.isEnabledFor(logging.DEBUG):
@@ -176,6 +209,13 @@ NOISE_ONLY_PATTERN = re.compile(r"^[\W_]+$")
 PADDLE_ENGINE_CACHE: dict[str, object] = {}
 PADDLE_ENGINE_LOCK = threading.Lock()
 PADDLE_INIT_ERRORS: dict[str, str] = {}
+_PADDLE_PM_SUPPORT: dict[tuple[str, str], bool] = {
+    ("en", "PP-OCRv3"): False,
+    ("en", "PP-OCRv4"): False,
+    ("en", "PP-OCRv5"): True,
+}
+_PADDLE_PM_RECHECK_VERSION = "PP-OCRv5"
+_PM_SENTINEL = "<PM?>"
 DIMENSION_PATTERNS = [
     re.compile(r"^\d{1,4}\u00b1\d{1,3}$"),
     re.compile(r"^[\u2300\u00d8\u03c6]\d{1,4}\u00b1\d{1,3}$"),
@@ -364,6 +404,35 @@ def extract_region_text(
 
         # Cross-engine fusion: if Paddle dropped ± and Tesseract read it as
         # a lookalike character, reconstruct the correct string.
+        sentinel_text = _inject_pm_sentinel(extraction.text, tess_extraction.text)
+        if sentinel_text:
+            all_candidates.append(OcrCandidate(
+                variant_name="paddle_pm_suspect",
+                backend="paddle",
+                text=sentinel_text,
+                confidence=extraction.confidence,
+                score=score_candidate(sentinel_text, extraction.confidence),
+            ))
+
+        if _should_recheck_plus_minus_with_paddle_v5(ocr_config, extraction, tess_extraction):
+            t0 = time.perf_counter()
+            v5_extraction = _extract_with_paddle(
+                prepared,
+                ocr_config,
+                force_version=_PADDLE_PM_RECHECK_VERSION,
+            )
+            _LOG.debug("   [%s] paddle_v5_recheck: %.0fms  result=%r  conf=%.1f",
+                       region.name, (time.perf_counter() - t0) * 1000,
+                       v5_extraction.text, v5_extraction.confidence)
+            if v5_extraction.text:
+                all_candidates.append(OcrCandidate(
+                    variant_name="paddle_v5_recheck",
+                    backend="paddle",
+                    text=v5_extraction.text,
+                    confidence=v5_extraction.confidence,
+                    score=score_candidate(v5_extraction.text, v5_extraction.confidence),
+                ))
+
         if extraction.text and tess_extraction.text:
             fused = _fuse_pm(extraction.text, tess_extraction.text)
             if fused:
@@ -457,15 +526,16 @@ def normalize_ocr_text(text: str) -> str:
 
 
 def score_candidate(text: str, confidence: float) -> float:
+    scored_text = text.replace(_PM_SENTINEL, "\u00b1")
     score = confidence
-    if any(pattern.match(text) for pattern in DIMENSION_PATTERNS):
+    if any(pattern.match(scored_text) for pattern in DIMENSION_PATTERNS):
         score += 40.0
-    score += sum(char.isdigit() for char in text) * 1.2
-    if "\u00b1" in text:
+    score += sum(char.isdigit() for char in scored_text) * 1.2
+    if _contains_pm_marker(text):
         score += 15.0
-    if "%" in text:
+    if "%" in scored_text:
         score += 8.0
-    bad_chars = sum(1 for char in text if char not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя\u00b1\u2300\u00d8\u03c6%.-")
+    bad_chars = sum(1 for char in text if char not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя\u00b1\u2300\u00d8\u03c6%.-<>PM?")
     score -= bad_chars * 6.0
     return score
 
@@ -782,8 +852,12 @@ def _tesseract_quick_pass(
     return _extract_with_tesseract(gray, ocr_config)
 
 
-def _extract_with_paddle(image: Image.Image, ocr_config: OcrConfig) -> OcrExtraction:
-    engine = _get_paddle_engine(ocr_config)
+def _extract_with_paddle(
+    image: Image.Image,
+    ocr_config: OcrConfig,
+    force_version: str | None = None,
+) -> OcrExtraction:
+    engine = _get_paddle_engine(ocr_config, force_version=force_version)
     if engine is None:
         return OcrExtraction(text="", confidence=0.0)
     paddle_input = np.asarray(image.convert("RGB"))
@@ -900,11 +974,15 @@ def _parse_paddle_result(result: object) -> OcrExtraction:
     )
 
 
-def _get_paddle_engine(ocr_config: OcrConfig) -> object | None:
+def _requested_paddle_version(ocr_config: OcrConfig) -> str:
+    return getattr(ocr_config, "ocr_version", "PP-OCRv3") or "PP-OCRv3"
+
+
+def _get_paddle_engine(ocr_config: OcrConfig, force_version: str | None = None) -> object | None:
     if PaddleOCR is None:
         return None
     lang = _resolve_paddle_lang(ocr_config.languages)
-    version = getattr(ocr_config, "ocr_version", "PP-OCRv3") or "PP-OCRv3"
+    version = force_version or _requested_paddle_version(ocr_config)
     cache_key = f"{lang}:{version}"
     with PADDLE_ENGINE_LOCK:
         if cache_key in PADDLE_ENGINE_CACHE:
@@ -929,12 +1007,28 @@ def _get_paddle_engine(ocr_config: OcrConfig) -> object | None:
 
 def _resolve_paddle_lang(languages: str) -> str:
     tokens = {token.strip().lower() for token in languages.split("+") if token.strip()}
-    # For dimension zones, English digits/symbol models are usually cleaner than mixed Cyrillic.
-    if tokens <= {"eng", "en", "rus", "ru"}:
-        return "en"
     if {"rus", "ru"} & tokens and not ({"eng", "en"} & tokens):
         return "ru"
+    # For dimension zones, English digits/symbol models are usually cleaner than mixed Cyrillic.
     return "en"
+
+
+def _paddle_model_supports_plus_minus(lang: str, version: str) -> bool:
+    return _PADDLE_PM_SUPPORT.get((lang, version), True)
+
+
+def _should_recheck_plus_minus_with_paddle_v5(
+    ocr_config: OcrConfig,
+    paddle_extraction: OcrExtraction,
+    tess_extraction: OcrExtraction,
+) -> bool:
+    requested = _requested_paddle_version(ocr_config)
+    lang = _resolve_paddle_lang(ocr_config.languages)
+    if _paddle_model_supports_plus_minus(lang, requested):
+        return False
+    if not paddle_extraction.text or _contains_pm_marker(paddle_extraction.text):
+        return False
+    return _inject_pm_sentinel(paddle_extraction.text, tess_extraction.text) is not None
 
 
 def _preferred_backend(ocr_config: OcrConfig) -> str:
@@ -1065,7 +1159,7 @@ def _adaptive_threshold(gray: np.ndarray, block_size: int = 31, offset: int = 11
 def _ensure_ocr_ready(ocr_config: OcrConfig) -> None:
     if _get_paddle_engine(ocr_config) is not None:
         return
-    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{getattr(ocr_config, 'ocr_version', 'PP-OCRv3')}"
+    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{_requested_paddle_version(ocr_config)}"
     if pytesseract is None:
         details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
@@ -1082,9 +1176,12 @@ def _ensure_ocr_ready(ocr_config: OcrConfig) -> None:
 
 def get_template_ocr_backend_info(ocr_config: OcrConfig) -> tuple[str, str]:
     if _get_paddle_engine(ocr_config) is not None:
-        version = getattr(ocr_config, "ocr_version", "PP-OCRv3") or "PP-OCRv3"
-        return "paddle", f"PaddleOCR {version}"
-    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{getattr(ocr_config, 'ocr_version', 'PP-OCRv3')}"
+        version = _requested_paddle_version(ocr_config)
+        lang = _resolve_paddle_lang(ocr_config.languages)
+        if _paddle_model_supports_plus_minus(lang, version):
+            return "paddle", f"PaddleOCR {version}"
+        return "paddle", f"PaddleOCR {version} + {_PADDLE_PM_RECHECK_VERSION} fallback for ±"
+    cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{_requested_paddle_version(ocr_config)}"
     if pytesseract is not None and resolve_tesseract_cmd(ocr_config.tesseract_cmd):
         details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
