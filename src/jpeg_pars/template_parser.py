@@ -1,36 +1,86 @@
 from __future__ import annotations
 
+import argparse
+import ctypes
 import json
 import logging
 import os
 import re
+import shutil
 import string
 import threading
 import time
 import unicodedata
 from dataclasses import asdict, dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 from openpyxl import Workbook
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from scipy import ndimage
-
-from .features import OcrConfig, SUPPORTED_EXTENSIONS, resolve_tesseract_cmd
+from scipy.fft import dctn
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg"}
+TOKEN_PATTERN = re.compile(r"[A-ZРЂ-Я0-9]{2,}")
+_LOAD_LOCK = threading.Lock()
+_DLLS_READY: set[str] = set()
+_COMMON_TESSERACT_ROOTS = [
+    Path(r"C:\Program Files\Tesseract-OCR"),
+    Path(r"C:\Program Files (x86)\Tesseract-OCR"),
+    Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR",
+]
+_RIL_WORD = 3
+
+
+@dataclass(slots=True)
+class OcrConfig:
+    mode: str = "auto"
+    tesseract_cmd: str | None = None
+    languages: str = "eng+rus"
+    psm: int = 6
+    ocr_version: str = "PP-OCRv3"
+
+
+@dataclass(slots=True)
+class ImageFeatures:
+    path: Path
+    phash: np.ndarray
+    dhash: np.ndarray
+    edge_map: np.ndarray
+    projection_x: np.ndarray
+    projection_y: np.ndarray
+    fill_ratio: float
+    content_bbox: np.ndarray
+    occupancy_grid: np.ndarray
+    component_count: int
+    ocr_tokens: frozenset[str]
+    ocr_bands: np.ndarray
+    ocr_enabled: bool
+
+
+@dataclass(slots=True)
+class ClusterResult:
+    groups: list[list[Path]]
+    scores: dict[str, dict[str, float]]
+    ocr_enabled: bool
+
+
+@dataclass(slots=True)
+class TesseractWord:
+    text: str
+    confidence: float
+    left: int
+    top: int
+    width: int
+    height: int
 
 try:
     from paddleocr import PaddleOCR
 except ImportError:
     PaddleOCR = None
-
-try:
-    import pytesseract
-    from pytesseract import Output as TesseractOutput
-except ImportError:
-    pytesseract = None
-    TesseractOutput = None
 
 _LOG = logging.getLogger("jpeg_pars.ocr")
 
@@ -146,7 +196,7 @@ def _contains_pm_marker(text: str) -> bool:
 
 
 def _split_joined_tolerance(text: str) -> tuple[str, str, str] | None:
-    match = re.match(r"^([\u2300\u00d8\u03c6]?)(\d{3,6})(%[A-Za-z]{0,4}|[A-Za-z]{1,4}|%)?$", text)
+    match = re.match(r"^([\u2300\u00d8\u03c6]?)(\d{4,6})(%[A-Za-z]{0,4}|[A-Za-z]{1,4}|%)?$", text)
     if match:
         prefix, digits, suffix = match.groups()
         tol_len = 2 if len(digits) >= 4 else 1
@@ -160,17 +210,32 @@ def _split_joined_tolerance(text: str) -> tuple[str, str, str] | None:
 def _inject_pm_sentinel(paddle_text: str, tess_text: str = "") -> str | None:
     if not paddle_text or _contains_pm_marker(paddle_text):
         return None
-    if tess_text:
-        if "\u00b1" in tess_text and tess_text.replace("\u00b1", "") == paddle_text:
-            return tess_text.replace("\u00b1", _PM_SENTINEL)
-        fused = _fuse_pm(paddle_text, tess_text)
-        if fused:
-            return fused.replace("\u00b1", _PM_SENTINEL)
+    if not tess_text:
+        return None
+    if "\u00b1" in tess_text and tess_text.replace("\u00b1", "") == paddle_text:
+        return tess_text.replace("\u00b1", _PM_SENTINEL)
+    fused = _fuse_pm(paddle_text, tess_text)
+    if fused:
+        return fused.replace("\u00b1", _PM_SENTINEL)
     split = _split_joined_tolerance(paddle_text)
     if not split:
         return None
     left, tolerance, suffix = split
     return f"{left}{_PM_SENTINEL}{tolerance}{suffix}"
+
+
+def _merge_plus_minus_tokens(text: str) -> str:
+    return _normalize_measurement_text(text)
+
+
+def _contains_plus_minus_symbol(image: Image.Image) -> bool:
+    data = np.asarray(image.convert("L"), dtype=np.uint8)
+    binary = data < 180
+    row_projection = binary.sum(axis=1)
+    col_projection = binary.sum(axis=0)
+    strong_rows = np.count_nonzero(row_projection >= max(3, binary.shape[1] * 0.20))
+    strong_cols = np.count_nonzero(col_projection >= max(3, binary.shape[0] * 0.20))
+    return strong_rows >= 3 and strong_cols >= 1
 
 
 def _log_char_analysis(region_name: str, raw_words: list["OcrCandidate"], final_text: str) -> None:
@@ -840,7 +905,7 @@ def _tesseract_quick_pass(
     Uses the upscaled-gray variant only (no multi-variant sweep) to keep
     overhead low.  Returns (extraction, raw_word_candidates).
     """
-    if pytesseract is None or not resolve_tesseract_cmd(ocr_config.tesseract_cmd):
+    if not is_tesseract_available(ocr_config.tesseract_cmd):
         return OcrExtraction(text="", confidence=0.0), []
     inner = _crop_inner_border(image)
     gray = ImageOps.autocontrast(inner.convert("L"))
@@ -878,15 +943,13 @@ def _extract_with_paddle(
 def _extract_with_tesseract(
     image: Image.Image, ocr_config: OcrConfig
 ) -> tuple[OcrExtraction, list["OcrCandidate"]]:
-    _apply_tesseract_cmd(ocr_config)
-    if pytesseract is None:
-        return OcrExtraction(text="", confidence=0.0), []
     try:
-        data = pytesseract.image_to_data(
+        data = tesseract_image_to_data(
             image,
             lang=ocr_config.languages,
-            config=_build_tesseract_config(7),
-            output_type=TesseractOutput.DICT,
+            psm=7,
+            variables=_build_tesseract_variables(),
+            tesseract_path=ocr_config.tesseract_cmd,
         )
     except Exception:
         return OcrExtraction(text="", confidence=0.0), []
@@ -1034,7 +1097,7 @@ def _should_recheck_plus_minus_with_paddle_v5(
 def _preferred_backend(ocr_config: OcrConfig) -> str:
     if _get_paddle_engine(ocr_config) is not None:
         return "paddle"
-    if pytesseract is not None and resolve_tesseract_cmd(ocr_config.tesseract_cmd):
+    if is_tesseract_available(ocr_config.tesseract_cmd):
         return "tesseract"
     return "none"
 
@@ -1113,16 +1176,17 @@ def _psm_candidates(base_psm: int) -> list[int]:
     return _unique_preserve_order([base_psm, 5, 6, 7, 11, 12, 13])
 
 
-def _build_tesseract_config(psm: int) -> str:
-    return (
-        f"--oem 3 --psm {psm} "
-        "-c preserve_interword_spaces=1 "
-        "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-        ".,:;+-\u00b1*/()[]{}<>=%\u2300\u00d8\u03c6"
-    )
+def _build_tesseract_variables() -> dict[str, str]:
+    return {
+        "preserve_interword_spaces": "1",
+        "tessedit_char_whitelist": (
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+            "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+            ".,:;+-\u00b1*/()[]{}<>=%\u2300\u00d8\u03c6"
+        ),
+    }
 
 
 def _otsu_threshold(gray: np.ndarray) -> np.ndarray:
@@ -1160,18 +1224,11 @@ def _ensure_ocr_ready(ocr_config: OcrConfig) -> None:
     if _get_paddle_engine(ocr_config) is not None:
         return
     cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{_requested_paddle_version(ocr_config)}"
-    if pytesseract is None:
+    if not is_tesseract_available(ocr_config.tesseract_cmd):
         details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
             raise RuntimeError(f"PaddleOCR failed to initialize: {details}")
-        raise RuntimeError("No OCR backend is installed. Install PaddleOCR or Tesseract.")
-    resolved = resolve_tesseract_cmd(ocr_config.tesseract_cmd)
-    if not resolved:
-        details = PADDLE_INIT_ERRORS.get(cache_key)
-        if details:
-            raise RuntimeError(f"PaddleOCR failed to initialize: {details}")
-        raise RuntimeError("No OCR backend is available. Install PaddleOCR or set tesseract.exe.")
-    pytesseract.pytesseract.tesseract_cmd = resolved
+        raise RuntimeError("No OCR backend is available. Install PaddleOCR or Tesseract library.")
 
 
 def get_template_ocr_backend_info(ocr_config: OcrConfig) -> tuple[str, str]:
@@ -1182,7 +1239,7 @@ def get_template_ocr_backend_info(ocr_config: OcrConfig) -> tuple[str, str]:
             return "paddle", f"PaddleOCR {version}"
         return "paddle", f"PaddleOCR {version} + {_PADDLE_PM_RECHECK_VERSION} fallback for ±"
     cache_key = f"{_resolve_paddle_lang(ocr_config.languages)}:{_requested_paddle_version(ocr_config)}"
-    if pytesseract is not None and resolve_tesseract_cmd(ocr_config.tesseract_cmd):
+    if is_tesseract_available(ocr_config.tesseract_cmd):
         details = PADDLE_INIT_ERRORS.get(cache_key)
         if details:
             return "tesseract", f"Tesseract fallback, Paddle init error: {details}"
@@ -1193,9 +1250,576 @@ def get_template_ocr_backend_info(ocr_config: OcrConfig) -> tuple[str, str]:
     return "none", "No OCR backend available"
 
 
-def _apply_tesseract_cmd(ocr_config: OcrConfig) -> None:
-    if pytesseract is None:
-        return
-    resolved = resolve_tesseract_cmd(ocr_config.tesseract_cmd)
-    if resolved:
-        pytesseract.pytesseract.tesseract_cmd = resolved
+def _normalize_tesseract_root(candidate: Path) -> Path | None:
+    if not candidate.exists():
+        return None
+    if candidate.is_dir():
+        return candidate
+    if candidate.name.lower() == "tesseract.exe":
+        return candidate.parent
+    if candidate.name.lower().startswith("libtesseract") and candidate.suffix.lower() == ".dll":
+        return candidate.parent
+    return None
+
+
+def _is_valid_tesseract_root(root: Path) -> bool:
+    return (root / "libtesseract-5.dll").exists() and (root / "libleptonica-6.dll").exists() and (root / "tessdata").exists()
+
+
+def resolve_tesseract_root(explicit_path: str | None = None) -> Path | None:
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    for env_name in ("TESSERACT_ROOT", "TESSERACT_CMD"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(Path(value))
+    path_cmd = shutil.which("tesseract")
+    if path_cmd:
+        candidates.append(Path(path_cmd))
+    candidates.extend(_COMMON_TESSERACT_ROOTS)
+    for candidate in candidates:
+        root = _normalize_tesseract_root(candidate)
+        if root and _is_valid_tesseract_root(root):
+            return root
+    return None
+
+
+def resolve_tesseract_cmd(explicit_path: str | None = None) -> str | None:
+    root = resolve_tesseract_root(explicit_path)
+    if root is None:
+        return None
+    exe_candidate = root / "tesseract.exe"
+    return str(exe_candidate) if exe_candidate.exists() else None
+
+
+def is_tesseract_available(explicit_path: str | None = None) -> bool:
+    return resolve_tesseract_root(explicit_path) is not None
+
+
+def _ensure_tesseract_dlls_loaded(root: Path) -> None:
+    root_key = str(root.resolve())
+    with _LOAD_LOCK:
+        if root_key in _DLLS_READY:
+            return
+        os.add_dll_directory(root_key)
+        _DLLS_READY.add(root_key)
+
+
+class _TesseractBindings:
+    def __init__(self, root: Path, *, lang: str, psm: int, variables: dict[str, str]) -> None:
+        self._lib = ctypes.CDLL(str(root / "libtesseract-5.dll"))
+        self._lep = ctypes.CDLL(str(root / "libleptonica-6.dll"))
+        self._configure_signatures()
+        self._api = self._lib.TessBaseAPICreate()
+        if not self._api:
+            raise RuntimeError("Failed to create Tesseract API instance.")
+        rc = self._lib.TessBaseAPIInit3(self._api, str(root / "tessdata").encode("utf-8"), lang.encode("utf-8"))
+        if rc != 0:
+            self.close()
+            raise RuntimeError(f"Failed to initialize Tesseract API for language {lang!r}.")
+        self._lib.TessBaseAPISetPageSegMode(self._api, psm)
+        for key, value in variables.items():
+            self._lib.TessBaseAPISetVariable(self._api, key.encode("utf-8"), value.encode("utf-8"))
+
+    def _configure_signatures(self) -> None:
+        self._lib.TessBaseAPICreate.restype = ctypes.c_void_p
+        self._lib.TessBaseAPIDelete.argtypes = [ctypes.c_void_p]
+        self._lib.TessBaseAPIInit3.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        self._lib.TessBaseAPIInit3.restype = ctypes.c_int
+        self._lib.TessBaseAPISetPageSegMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.TessBaseAPISetVariable.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        self._lib.TessBaseAPISetVariable.restype = ctypes.c_bool
+        self._lib.TessBaseAPISetImage2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.TessBaseAPIRecognize.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.TessBaseAPIRecognize.restype = ctypes.c_int
+        self._lib.TessBaseAPIGetIterator.argtypes = [ctypes.c_void_p]
+        self._lib.TessBaseAPIGetIterator.restype = ctypes.c_void_p
+        self._lib.TessResultIteratorGetUTF8Text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.TessResultIteratorGetUTF8Text.restype = ctypes.c_void_p
+        self._lib.TessResultIteratorConfidence.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.TessResultIteratorConfidence.restype = ctypes.c_float
+        self._lib.TessPageIteratorBoundingBox.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._lib.TessPageIteratorBoundingBox.restype = ctypes.c_bool
+        self._lib.TessPageIteratorNext.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.TessPageIteratorNext.restype = ctypes.c_bool
+        self._lib.TessDeleteText.argtypes = [ctypes.c_void_p]
+        self._lep.pixReadMem.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._lep.pixReadMem.restype = ctypes.c_void_p
+        self._lep.pixDestroy.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+
+    def close(self) -> None:
+        api = getattr(self, "_api", None)
+        if api:
+            self._lib.TessBaseAPIDelete(api)
+            self._api = None
+
+    def _pix_from_image(self, image: Image.Image) -> int:
+        converted = image.convert("RGB")
+        buffer = BytesIO()
+        converted.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        raw = ctypes.create_string_buffer(data)
+        pix = self._lep.pixReadMem(raw, len(data))
+        if not pix:
+            raise RuntimeError("Failed to convert PIL image to Leptonica PIX.")
+        return int(pix)
+
+    def _iter_words(self) -> list[TesseractWord]:
+        iterator = self._lib.TessBaseAPIGetIterator(self._api)
+        if not iterator:
+            return []
+        words: list[TesseractWord] = []
+        while True:
+            text_ptr = self._lib.TessResultIteratorGetUTF8Text(iterator, _RIL_WORD)
+            text = ""
+            if text_ptr:
+                text = ctypes.string_at(text_ptr).decode("utf-8", errors="replace").strip()
+                self._lib.TessDeleteText(text_ptr)
+            conf = float(self._lib.TessResultIteratorConfidence(iterator, _RIL_WORD))
+            left = ctypes.c_int()
+            top = ctypes.c_int()
+            right = ctypes.c_int()
+            bottom = ctypes.c_int()
+            has_box = self._lib.TessPageIteratorBoundingBox(
+                iterator,
+                _RIL_WORD,
+                ctypes.byref(left),
+                ctypes.byref(top),
+                ctypes.byref(right),
+                ctypes.byref(bottom),
+            )
+            if text and has_box:
+                words.append(
+                    TesseractWord(
+                        text=text,
+                        confidence=conf,
+                        left=left.value,
+                        top=top.value,
+                        width=max(0, right.value - left.value),
+                        height=max(0, bottom.value - top.value),
+                    )
+                )
+            if not self._lib.TessPageIteratorNext(iterator, _RIL_WORD):
+                break
+        return words
+
+    def image_to_data(self, image: Image.Image) -> dict[str, list[object]]:
+        pix = self._pix_from_image(image)
+        try:
+            rc = self._lib.TessBaseAPISetImage2(self._api, pix)
+            _ = rc
+            if self._lib.TessBaseAPIRecognize(self._api, None) != 0:
+                raise RuntimeError("Tesseract recognition failed.")
+            words = self._iter_words()
+        finally:
+            pix_handle = ctypes.c_void_p(pix)
+            self._lep.pixDestroy(ctypes.byref(pix_handle))
+        return {
+            "text": [word.text for word in words],
+            "conf": [word.confidence for word in words],
+            "left": [word.left for word in words],
+            "top": [word.top for word in words],
+            "width": [word.width for word in words],
+            "height": [word.height for word in words],
+        }
+
+
+def tesseract_image_to_data(
+    image: Image.Image,
+    *,
+    lang: str,
+    psm: int,
+    variables: dict[str, str] | None = None,
+    tesseract_path: str | None = None,
+) -> dict[str, list[object]]:
+    root = resolve_tesseract_root(tesseract_path)
+    if root is None:
+        raise RuntimeError("Tesseract installation not found.")
+    _ensure_tesseract_dlls_loaded(root)
+    api = _TesseractBindings(root, lang=lang, psm=psm, variables=variables or {})
+    try:
+        return api.image_to_data(image)
+    finally:
+        api.close()
+
+
+def _normalize_image(image: Image.Image, size: int = 256) -> np.ndarray:
+    image = ImageOps.autocontrast(image)
+    image = ImageOps.pad(image, (size, size), color=255, method=Image.Resampling.LANCZOS)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _binary_map(image: np.ndarray) -> np.ndarray:
+    threshold = float(np.percentile(image, 82))
+    binary = image < min(threshold, 0.92)
+    cleaned = ndimage.binary_opening(binary, structure=np.ones((2, 2), dtype=bool))
+    return cleaned.astype(np.uint8)
+
+
+def _phash(image: np.ndarray, hash_size: int = 8, highfreq_factor: int = 4) -> np.ndarray:
+    size = hash_size * highfreq_factor
+    pil = Image.fromarray((image * 255).astype(np.uint8), mode="L").resize((size, size), Image.Resampling.LANCZOS)
+    data = np.asarray(pil, dtype=np.float32)
+    coeffs = dctn(data, norm="ortho")
+    low_freq = coeffs[:hash_size, :hash_size]
+    median = np.median(low_freq[1:, 1:])
+    return (low_freq > median).astype(np.uint8).reshape(-1)
+
+
+def _dhash(image: np.ndarray, hash_size: int = 8) -> np.ndarray:
+    pil = Image.fromarray((image * 255).astype(np.uint8), mode="L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    data = np.asarray(pil, dtype=np.float32)
+    return (data[:, 1:] > data[:, :-1]).astype(np.uint8).reshape(-1)
+
+
+def _edge_map(image: np.ndarray, size: int = 64) -> np.ndarray:
+    pil = Image.fromarray((image * 255).astype(np.uint8), mode="L").resize((size, size), Image.Resampling.LANCZOS)
+    data = np.asarray(pil, dtype=np.float32) / 255.0
+    gx = np.zeros_like(data)
+    gy = np.zeros_like(data)
+    gx[:, 1:-1] = data[:, 2:] - data[:, :-2]
+    gy[1:-1, :] = data[2:, :] - data[:-2, :]
+    magnitude = np.hypot(gx, gy)
+    threshold = float(np.percentile(magnitude, 72))
+    return (magnitude >= threshold).astype(np.uint8)
+
+
+def _content_bbox(binary: np.ndarray) -> np.ndarray:
+    ys, xs = np.nonzero(binary)
+    if len(xs) == 0 or len(ys) == 0:
+        return np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    height, width = binary.shape
+    return np.array([xs.min() / width, ys.min() / height, xs.max() / width, ys.max() / height], dtype=np.float32)
+
+
+def _occupancy_grid(binary: np.ndarray, grid_size: int = 4) -> np.ndarray:
+    height, width = binary.shape
+    block_h = height // grid_size
+    block_w = width // grid_size
+    values: list[float] = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            top = row * block_h
+            left = col * block_w
+            bottom = height if row == grid_size - 1 else (row + 1) * block_h
+            right = width if col == grid_size - 1 else (col + 1) * block_w
+            values.append(float(binary[top:bottom, left:right].mean()))
+    return np.array(values, dtype=np.float32)
+
+
+def _component_count(binary: np.ndarray) -> int:
+    labeled, count = ndimage.label(binary)
+    if count == 0:
+        return 0
+    sizes = ndimage.sum(binary, labeled, range(1, count + 1))
+    return int(np.count_nonzero(np.asarray(sizes) >= 12))
+
+
+def _normalize_tokens(text: str) -> list[str]:
+    upper = text.upper().replace("O", "0")
+    return TOKEN_PATTERN.findall(upper)
+
+
+def _extract_ocr_features(image: Image.Image, ocr_config: OcrConfig | None) -> tuple[frozenset[str], np.ndarray, bool]:
+    config = ocr_config or OcrConfig()
+    if config.mode == "off":
+        return frozenset(), np.zeros(6, dtype=np.float32), False
+    if not is_tesseract_available(config.tesseract_cmd):
+        if config.mode == "required":
+            raise RuntimeError("OCR mode is required, but Tesseract library is not available.")
+        return frozenset(), np.zeros(6, dtype=np.float32), False
+    prepared = image.convert("L")
+    prepared = ImageOps.autocontrast(prepared)
+    prepared = prepared.resize((prepared.width * 2, prepared.height * 2), Image.Resampling.LANCZOS)
+    thresholded = prepared.point(lambda px: 0 if px < 210 else 255, mode="1")
+    try:
+        data = tesseract_image_to_data(
+            thresholded,
+            lang=config.languages,
+            psm=config.psm,
+            tesseract_path=config.tesseract_cmd,
+        )
+    except Exception:
+        if config.mode == "required":
+            raise
+        return frozenset(), np.zeros(6, dtype=np.float32), False
+    tokens: set[str] = set()
+    bands = np.zeros(6, dtype=np.float32)
+    total = max(1, thresholded.height)
+    for text, top, box_height, confidence in zip(
+        data.get("text", []),
+        data.get("top", []),
+        data.get("height", []),
+        data.get("conf", []),
+    ):
+        if str(confidence).strip() in {"", "-1"}:
+            continue
+        try:
+            if float(confidence) < 20.0:
+                continue
+        except ValueError:
+            continue
+        normalized = _normalize_tokens(str(text))
+        if not normalized:
+            continue
+        tokens.update(normalized)
+        center = (int(top) + int(box_height) * 0.5) / total
+        band_index = min(len(bands) - 1, max(0, int(center * len(bands))))
+        bands[band_index] += len(normalized)
+    if bands.sum() > 0:
+        bands /= bands.sum()
+    return frozenset(sorted(tokens)), bands, True
+
+
+def load_features(path: Path, ocr_config: OcrConfig | None = None) -> ImageFeatures:
+    image = Image.open(path).convert("L")
+    normalized = _normalize_image(image)
+    binary = _binary_map(normalized)
+    edge_map = _edge_map(normalized)
+    ocr_tokens, ocr_bands, ocr_enabled = _extract_ocr_features(image, ocr_config)
+    return ImageFeatures(
+        path=path,
+        phash=_phash(normalized),
+        dhash=_dhash(normalized),
+        edge_map=edge_map,
+        projection_x=edge_map.mean(axis=0),
+        projection_y=edge_map.mean(axis=1),
+        fill_ratio=float(binary.mean()),
+        content_bbox=_content_bbox(binary),
+        occupancy_grid=_occupancy_grid(binary),
+        component_count=_component_count(binary),
+        ocr_tokens=ocr_tokens,
+        ocr_bands=ocr_bands,
+        ocr_enabled=ocr_enabled,
+    )
+
+
+def hash_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    return 100.0 * (1.0 - np.count_nonzero(left != right) / left.size)
+
+
+def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    left_norm = np.linalg.norm(left)
+    right_norm = np.linalg.norm(right)
+    if left_norm == 0.0 and right_norm == 0.0:
+        return 100.0
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return 100.0 * float(np.dot(left, right) / (left_norm * right_norm))
+
+
+def edge_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    return 100.0 * (1.0 - np.count_nonzero(left != right) / left.size)
+
+
+def ratio_similarity(left: float, right: float) -> float:
+    scale = max(abs(left), abs(right), 1e-6)
+    return max(0.0, 100.0 * (1.0 - abs(left - right) / scale))
+
+
+def bbox_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    return max(0.0, 100.0 * (1.0 - float(np.abs(left - right).mean())))
+
+
+def token_similarity(left: frozenset[str], right: frozenset[str]) -> float | None:
+    if not left and not right:
+        return None
+    if not left or not right:
+        return 0.0
+    intersection = len(left & right)
+    union = len(left | right)
+    return None if union == 0 else 100.0 * intersection / union
+
+
+def structure_similarity(left: ImageFeatures, right: ImageFeatures) -> float:
+    return round(
+        ratio_similarity(left.fill_ratio, right.fill_ratio) * 0.20
+        + bbox_similarity(left.content_bbox, right.content_bbox) * 0.25
+        + cosine_similarity(left.occupancy_grid, right.occupancy_grid) * 0.35
+        + ratio_similarity(float(left.component_count), float(right.component_count)) * 0.20,
+        2,
+    )
+
+
+def ocr_similarity(left: ImageFeatures, right: ImageFeatures) -> float | None:
+    token_score = token_similarity(left.ocr_tokens, right.ocr_tokens)
+    band_score = cosine_similarity(left.ocr_bands, right.ocr_bands)
+    if token_score is None:
+        return None if (not left.ocr_enabled and not right.ocr_enabled) else 0.0
+    return round(token_score * 0.80 + band_score * 0.20, 2)
+
+
+def combined_similarity(left: ImageFeatures, right: ImageFeatures) -> float:
+    components: list[tuple[float, float]] = [
+        (hash_similarity(left.phash, right.phash), 0.12),
+        (hash_similarity(left.dhash, right.dhash), 0.08),
+        (edge_similarity(left.edge_map, right.edge_map), 0.22),
+        ((cosine_similarity(left.projection_x, right.projection_x) + cosine_similarity(left.projection_y, right.projection_y)) / 2.0, 0.12),
+        (structure_similarity(left, right), 0.26),
+    ]
+    ocr_score = ocr_similarity(left, right)
+    if ocr_score is not None:
+        components.append((ocr_score, 0.20))
+    weighted_sum = sum(score * weight for score, weight in components)
+    total_weight = sum(weight for _, weight in components)
+    return round(weighted_sum / total_weight, 2)
+
+
+class UnionFind:
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+        self.rank = [0] * size
+
+    def find(self, index: int) -> int:
+        while self.parent[index] != index:
+            self.parent[index] = self.parent[self.parent[index]]
+            index = self.parent[index]
+        return index
+
+    def union(self, left: int, right: int) -> None:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return
+        if self.rank[left_root] < self.rank[right_root]:
+            self.parent[left_root] = right_root
+        elif self.rank[left_root] > self.rank[right_root]:
+            self.parent[right_root] = left_root
+        else:
+            self.parent[right_root] = left_root
+            self.rank[left_root] += 1
+
+
+def discover_images(input_dir: Path, recursive: bool) -> list[Path]:
+    iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
+    return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS)
+
+
+def cluster_images(
+    input_dir: Path,
+    similarity_threshold: int,
+    recursive: bool = False,
+    ocr_config: OcrConfig | None = None,
+) -> ClusterResult:
+    files = discover_images(input_dir, recursive=recursive)
+    if not files:
+        raise ValueError(f"No JPEG files found in {input_dir}")
+    features = [load_features(path, ocr_config=ocr_config) for path in files]
+    union_find = UnionFind(len(features))
+    for left_index in range(len(features)):
+        for right_index in range(left_index + 1, len(features)):
+            if combined_similarity(features[left_index], features[right_index]) >= similarity_threshold:
+                union_find.union(left_index, right_index)
+    grouped: dict[int, list[Path]] = {}
+    for index, item in enumerate(features):
+        grouped.setdefault(union_find.find(index), []).append(item.path)
+    groups = sorted((sorted(paths) for paths in grouped.values()), key=lambda paths: (-len(paths), str(paths[0]).lower()))
+    feature_by_path = {feature.path: feature for feature in features}
+    scores: dict[str, dict[str, float]] = {}
+    for group in groups:
+        if len(group) < 2:
+            continue
+        anchor = group[0]
+        scores[str(anchor)] = {}
+        for path in group[1:]:
+            scores[str(anchor)][str(path)] = combined_similarity(feature_by_path[anchor], feature_by_path[path])
+    return ClusterResult(groups=groups, scores=scores, ocr_enabled=any(feature.ocr_enabled for feature in features))
+
+
+def materialize_groups(
+    result: ClusterResult,
+    output_dir: Path,
+    source_root: Path,
+    mode: str = "copy",
+    min_group_size: int = 1,
+    ocr_config: OcrConfig | None = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for index, group in enumerate(result.groups, start=1):
+        if len(group) < min_group_size:
+            continue
+        group_dir = output_dir / f"group_{index:03d}"
+        group_dir.mkdir(parents=True, exist_ok=True)
+        for item in group:
+            destination = group_dir / item.name
+            if destination.exists():
+                destination = group_dir / f"{item.stem}_{abs(hash(item)) % 100000}{item.suffix.lower()}"
+            if mode == "move":
+                shutil.move(str(item), str(destination))
+            else:
+                shutil.copy2(item, destination)
+    report = {
+        "source_root": str(source_root),
+        "group_count": len(result.groups),
+        "ocr": {
+            "mode": (ocr_config.mode if ocr_config else "auto"),
+            "enabled_for_at_least_one_file": result.ocr_enabled,
+            "languages": (ocr_config.languages if ocr_config else "eng+rus"),
+            "psm": (ocr_config.psm if ocr_config else 6),
+        },
+        "groups": [
+            {"group": f"group_{index:03d}", "size": len(group), "files": [str(path) for path in group]}
+            for index, group in enumerate(result.groups, start=1)
+            if len(group) >= min_group_size
+        ],
+        "scores_from_anchor": result.scores,
+    }
+    (output_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="jpeg-pars", description="Sort JPEG drawings into folders based on visual similarity.")
+    parser.add_argument("--input", required=True, type=Path, help="Folder with JPEG images.")
+    parser.add_argument("--output", required=True, type=Path, help="Folder where grouped files will be written.")
+    parser.add_argument("--similarity", required=True, type=int, help="Similarity threshold from 1 to 100.")
+    parser.add_argument("--mode", choices=("copy", "move"), default="copy", help="Copy files by default; move if requested.")
+    parser.add_argument("--recursive", action="store_true", help="Search JPEG files in nested folders.")
+    parser.add_argument("--min-group-size", type=int, default=1, help="Skip writing groups smaller than this value.")
+    parser.add_argument("--ocr-mode", choices=("auto", "off", "required"), default="auto", help="Use OCR in auto mode, disable it, or require it.")
+    parser.add_argument("--tesseract-cmd", type=str, default=None, help="Path to Tesseract installation, DLL folder, or tesseract.exe.")
+    parser.add_argument("--ocr-lang", type=str, default="eng+rus", help="OCR languages, for example eng or eng+rus.")
+    parser.add_argument("--ocr-psm", type=int, default=6, help="Tesseract page segmentation mode.")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.input.exists() or not args.input.is_dir():
+        parser.error(f"Input folder does not exist: {args.input}")
+    if not 1 <= args.similarity <= 100:
+        parser.error("--similarity must be in range 1..100")
+    if args.min_group_size < 1:
+        parser.error("--min-group-size must be >= 1")
+    if args.ocr_psm < 0:
+        parser.error("--ocr-psm must be >= 0")
+    ocr_config = OcrConfig(
+        mode=args.ocr_mode,
+        tesseract_cmd=args.tesseract_cmd,
+        languages=args.ocr_lang,
+        psm=args.ocr_psm,
+    )
+    result = cluster_images(
+        input_dir=args.input,
+        similarity_threshold=args.similarity,
+        recursive=args.recursive,
+        ocr_config=ocr_config,
+    )
+    materialize_groups(
+        result=result,
+        output_dir=args.output,
+        source_root=args.input,
+        mode=args.mode,
+        min_group_size=args.min_group_size,
+        ocr_config=ocr_config,
+    )
+    file_count = sum(len(group) for group in result.groups)
+    print(f"Processed {file_count} files into {len(result.groups)} groups. OCR active: {'yes' if result.ocr_enabled else 'no'}. Output: {args.output}")

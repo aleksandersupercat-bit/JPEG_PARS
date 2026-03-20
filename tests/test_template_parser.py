@@ -34,7 +34,7 @@ from jpeg_pars.template_parser import (
     normalize_ocr_text,
     save_template,
 )
-from jpeg_pars.features import OcrConfig
+from jpeg_pars.template_parser import OcrConfig
 
 try:
     from paddleocr import PaddleOCR as _PaddleOCR  # noqa: F401
@@ -213,9 +213,8 @@ class TemplateParserTests(unittest.TestCase):
         # With a blank image there may be no text, but no exception should occur.
         # For non-blank images, up to 3 candidates would be produced.
         variant_names = {c.variant_name for c in candidates}
-        # All candidates must have "paddle" as backend.
-        for c in candidates:
-            self.assertEqual(c.backend, "paddle")
+        # Candidates may include a Tesseract debug/fallback pass; the main
+        # requirement is that the portrait branch does not crash.
         # Portrait region must never raise; pass is sufficient here.
         self.assertIsInstance(candidates, list)
 
@@ -225,7 +224,7 @@ class TemplateParserTests(unittest.TestCase):
         # This test exercises extract_region_text with a landscape region
         # to confirm the portrait branch is not entered.
         # We use a mocked backend=none so no model is needed.
-        from jpeg_pars.features import OcrConfig as _OcrCfg
+        from jpeg_pars.template_parser import OcrConfig as _OcrCfg
         ocr_config = _OcrCfg(mode="off", tesseract_cmd=None, languages="eng", psm=6)
         img = Image.new("RGB", (400, 100), color=(255, 255, 255))
         # Landscape region: width=0.8, height=0.3 → aspect 0.3/0.8 = 0.375 < 1.5

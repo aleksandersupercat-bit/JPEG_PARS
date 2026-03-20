@@ -13,12 +13,11 @@ dependencies = [
   "openpyxl>=3.1",
   "paddleocr>=2.10",
   "Pillow>=10.0",
-  "pytesseract>=0.3.10",
   "scipy>=1.11",
 ]
 
 [project.scripts]
-jpeg-pars = "jpeg_pars.cli:main"
+jpeg-pars = "jpeg_pars.template_parser:main"
 jpeg-pars-gui = "jpeg_pars.gui:main"
 
 [tool.setuptools]

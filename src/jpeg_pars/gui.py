@@ -9,17 +9,20 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from PIL import Image, ImageTk
 
-from .clustering import ClusterResult, cluster_images, materialize_groups
-from .features import OcrConfig, resolve_tesseract_cmd
 from .template_parser import (
+    ClusterResult,
+    OcrConfig,
     OcrCandidate,
     ParsedSheet,
     TemplateRegion,
+    cluster_images,
     default_region_name,
     export_results_to_excel,
     get_template_ocr_backend_info,
     load_template,
+    materialize_groups,
     parse_template_batch,
+    resolve_tesseract_cmd,
     save_template,
 )
 
@@ -202,7 +205,7 @@ class JpegParsApp(tk.Tk):
         ttk.Label(controls, text="Языки OCR").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(controls, textvariable=self.group_ocr_lang_var, width=20).grid(row=4, column=1, sticky="w", padx=8, pady=(8, 0))
 
-        ttk.Label(controls, text="Путь к tesseract.exe").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(controls, text="Путь к Tesseract").grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(controls, textvariable=self.group_tesseract_var, width=90).grid(row=5, column=1, sticky="ew", padx=8, pady=(8, 0))
         ttk.Button(controls, text="Выбрать", command=self._choose_tesseract_for_grouping).grid(row=5, column=2, padx=4, pady=(8, 0))
 
@@ -280,7 +283,7 @@ class JpegParsApp(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Label(ocr_row, text="  PP-OCRv3 — быстрый; для ± включается точечная проверка через PP-OCRv5", foreground="#666666").pack(side="left")
 
-        ttk.Label(top_controls, text="Путь к tesseract.exe").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(top_controls, text="Путь к Tesseract").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top_controls, textvariable=self.template_tesseract_var, width=88).grid(row=4, column=1, sticky="ew", padx=8, pady=(8, 0))
         ttk.Button(top_controls, text="Выбрать", command=self._choose_tesseract_for_template).grid(row=4, column=2, pady=(8, 0))
 
@@ -378,12 +381,12 @@ class JpegParsApp(tk.Tk):
             self.group_output_var.set(folder)
 
     def _choose_tesseract_for_grouping(self) -> None:
-        path = filedialog.askopenfilename(title="Выберите tesseract.exe", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Выберите Tesseract (.exe в папке установки)", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
         if path:
             self.group_tesseract_var.set(path)
 
     def _choose_tesseract_for_template(self) -> None:
-        path = filedialog.askopenfilename(title="Выберите tesseract.exe", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Выберите Tesseract (.exe в папке установки)", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
         if path:
             self.template_tesseract_var.set(path)
 

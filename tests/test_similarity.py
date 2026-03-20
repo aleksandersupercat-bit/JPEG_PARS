@@ -10,8 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from jpeg_pars.clustering import cluster_images
-from jpeg_pars.features import OcrConfig
+from jpeg_pars.template_parser import OcrConfig, cluster_images
 
 
 def _make_test_image(path: Path, variant: str) -> None:
