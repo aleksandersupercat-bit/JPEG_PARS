@@ -5,13 +5,14 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
 from .template_parser import (
     ClusterResult,
+    DocumentPage,
     OcrConfig,
     OcrCandidate,
     ParsedSheet,
@@ -19,10 +20,11 @@ from .template_parser import (
     cluster_images,
     default_region_name,
     export_results_to_excel,
+    get_pdf_page_count,
     get_template_ocr_backend_info,
+    load_document_page_image,
     load_template,
     materialize_groups,
-    _open_image,
     parse_template_batch,
     save_template,
 )
@@ -73,10 +75,11 @@ class JpegParsApp(tk.Tk):
         self.template_preview_cache_key: tuple[int, int, int] | None = None
         self.group_result: ClusterResult | None = None
         self.group_output_dir: Path | None = None
-        self.group_path_index: dict[str, Path] = {}
+        self.group_path_index: dict[str, DocumentPage] = {}
 
         self.template_source_image: Image.Image | None = None
         self.template_source_path: Path | None = None
+        self.template_source_page_index: int | None = None
         self.template_canvas_image: Image.Image | None = None  # overrides source when browsing parsed files
         self.template_regions: list[TemplateRegion] = []
         self.template_results: list[ParsedSheet] = []
@@ -417,31 +420,52 @@ class JpegParsApp(tk.Tk):
             return
         self._render_group_preview(path)
 
-    def _render_group_preview(self, path: Path) -> None:
+    def _render_group_preview(self, path: DocumentPage) -> None:
         canvas = self.group_preview_canvas
         width = max(canvas.winfo_width(), 300)
         height = max(canvas.winfo_height(), 300)
-        image = _open_image(Path(path)).convert("RGB")
+        image = load_document_page_image(path)
         image.thumbnail((width - 20, height - 20), Image.Resampling.LANCZOS)
         self.group_preview_image = ImageTk.PhotoImage(image)
         canvas.delete("all")
         canvas.create_image(width // 2, height // 2, image=self.group_preview_image, anchor="center")
 
+    def _choose_pdf_page(self, path: Path) -> int | None:
+        page_count = get_pdf_page_count(path)
+        if page_count <= 1:
+            return 0
+        page_number = simpledialog.askinteger(
+            "Страница PDF",
+            f"Выберите страницу PDF от 1 до {page_count}:",
+            parent=self,
+            minvalue=1,
+            maxvalue=page_count,
+            initialvalue=1,
+        )
+        if page_number is None:
+            return None
+        return page_number - 1
+
     def _choose_template_image(self) -> None:
         path = filedialog.askopenfilename(
-            title="Выберите шаблон JPEG",
-            filetypes=[("JPEG files", "*.jpg;*.jpeg"), ("All files", "*.*")],
+            title="Выберите шаблон JPEG/PDF",
+            filetypes=[("JPEG/PDF files", "*.jpg;*.jpeg;*.pdf"), ("All files", "*.*")],
         )
         if not path:
             return
-        self.template_source_path = Path(path)
-        self.template_source_image = _open_image(Path(path)).convert("RGB")
+        source_path = Path(path)
+        page_index = self._choose_pdf_page(source_path) if source_path.suffix.lower() == ".pdf" else None
+        if source_path.suffix.lower() == ".pdf" and page_index is None:
+            return
+        self.template_source_path = source_path
+        self.template_source_page_index = page_index
+        self.template_source_image = load_document_page_image(DocumentPage(source_path, page_index))
         self.template_canvas_image = None
         self.template_zoom = 1.0
         self.template_manual_pan = False
         self.template_preview_cache_key = None
         self.template_preview_image = None
-        self.template_image_var.set(path)
+        self.template_image_var.set(path if page_index is None else f"{path} :: page {page_index + 1}")
         self.template_regions.clear()
         self.template_results.clear()
         self._refresh_region_tree()
@@ -461,7 +485,7 @@ class JpegParsApp(tk.Tk):
         )
         if not path:
             return
-        save_template(self.template_regions, self.template_source_path, Path(path))
+        save_template(self.template_regions, self.template_source_path, Path(path), page_index=self.template_source_page_index)
         self.template_status_var.set(f"Шаблон сохранен: {path}")
 
     def _load_template_file(self) -> None:
@@ -471,14 +495,15 @@ class JpegParsApp(tk.Tk):
         )
         if not path:
             return
-        image_path, regions = load_template(Path(path))
+        image_path, page_index, regions = load_template(Path(path))
         self.template_regions = regions
         self.template_results.clear()
         self.template_canvas_image = None
         if image_path and image_path.exists():
             self.template_source_path = image_path
-            self.template_source_image = _open_image(image_path).convert("RGB")
-            self.template_image_var.set(str(image_path))
+            self.template_source_page_index = page_index
+            self.template_source_image = load_document_page_image(DocumentPage(image_path, page_index))
+            self.template_image_var.set(str(image_path) if page_index is None else f"{image_path} :: page {page_index + 1}")
             self.template_zoom = 1.0
             self.template_manual_pan = False
             self.template_preview_cache_key = None
@@ -809,7 +834,8 @@ class JpegParsApp(tk.Tk):
             if 0 <= index < len(self.template_results):
                 file_path = self.template_results[index].file_path
                 try:
-                    self.template_canvas_image = _open_image(file_path).convert("RGB")
+                    row = self.template_results[index]
+                    self.template_canvas_image = load_document_page_image(DocumentPage(Path(file_path), row.page_index))
                     self.template_preview_cache_key = None
                     self.template_preview_image = None
                 except Exception:
@@ -939,7 +965,7 @@ class JpegParsApp(tk.Tk):
         for group_index, group in enumerate(result.groups, start=1):
             group_id = self.group_tree.insert("", "end", text=f"Group {group_index:03d} ({len(group)})", values=("group",))
             for item in group:
-                item_id = self.group_tree.insert(group_id, "end", text=item.name, values=("file",))
+                item_id = self.group_tree.insert(group_id, "end", text=item.display_name, values=("file",))
                 self.group_path_index[item_id] = item
         first_group = self.group_tree.get_children()
         if first_group:

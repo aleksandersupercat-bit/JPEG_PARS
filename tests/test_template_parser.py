@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 from jpeg_pars.template_parser import (
+    DocumentPage,
     OcrCandidate,
     ParsedSheet,
     TemplateRegion,
@@ -30,6 +31,9 @@ from jpeg_pars.template_parser import (
     default_region_name,
     export_results_to_excel,
     extract_region_text,
+    get_pdf_page_count,
+    list_input_pages,
+    load_document_page_image,
     load_template,
     normalize_ocr_text,
     save_template,
@@ -90,11 +94,29 @@ class TemplateParserTests(unittest.TestCase):
             image_path = Path(tmp_dir) / "source.jpg"
             image_path.write_text("stub", encoding="utf-8")
             save_template(regions, image_path, destination)
-            loaded_image_path, loaded_regions = load_template(destination)
+            loaded_image_path, loaded_page_index, loaded_regions = load_template(destination)
 
             self.assertEqual(loaded_image_path, image_path)
+            self.assertIsNone(loaded_page_index)
             self.assertEqual(len(loaded_regions), 2)
             self.assertEqual(loaded_regions[1].name, "B")
+
+    def test_pdf_helpers_enumerate_and_render_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "multi.pdf"
+            page1 = Image.new("RGB", (120, 80), color=(255, 255, 255))
+            page2 = Image.new("RGB", (120, 80), color=(240, 240, 240))
+            page1.save(pdf_path, save_all=True, append_images=[page2])
+
+            self.assertEqual(get_pdf_page_count(pdf_path), 2)
+            pages = list_input_pages(Path(tmp_dir))
+            self.assertEqual(
+                pages,
+                [DocumentPage(pdf_path, 0), DocumentPage(pdf_path, 1)],
+            )
+            rendered = load_document_page_image(pages[1])
+            self.assertGreater(rendered.width, 0)
+            self.assertGreater(rendered.height, 0)
 
     def test_normalize_ocr_text_preserves_plus_minus_and_percent(self) -> None:
         self.assertEqual(normalize_ocr_text("10 +- 0.2"), "10±0.2")

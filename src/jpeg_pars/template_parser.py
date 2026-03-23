@@ -26,7 +26,7 @@ from scipy.fft import dctn
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 warnings.filterwarnings("ignore", message=".*urllib3.*doesn't match a supported version.*")
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg"}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".pdf"}
 TOKEN_PATTERN = re.compile(r"[A-ZРЂ-Я0-9]{2,}")
 _LOAD_LOCK = threading.Lock()
 _DLLS_READY: set[str] = set()
@@ -64,9 +64,31 @@ class OcrConfig:
     ocr_version: str = "PP-OCRv3"
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentPage:
+    path: Path
+    page_index: int | None = None
+
+    @property
+    def is_pdf(self) -> bool:
+        return self.path.suffix.lower() == ".pdf"
+
+    @property
+    def display_name(self) -> str:
+        if self.page_index is None:
+            return self.path.name
+        return f"{self.path.name} [p.{self.page_index + 1}]"
+
+    @property
+    def output_name(self) -> str:
+        if self.page_index is None:
+            return self.path.name
+        return f"{self.path.stem}_p{self.page_index + 1:03d}.jpg"
+
+
 @dataclass(slots=True)
 class ImageFeatures:
-    path: Path
+    source: DocumentPage
     phash: np.ndarray
     dhash: np.ndarray
     edge_map: np.ndarray
@@ -83,7 +105,7 @@ class ImageFeatures:
 
 @dataclass(slots=True)
 class ClusterResult:
-    groups: list[list[Path]]
+    groups: list[list[DocumentPage]]
     scores: dict[str, dict[str, float]]
     ocr_enabled: bool
 
@@ -103,11 +125,70 @@ def _open_image(path: Path) -> Image.Image:
         image.load()
     return image
 
+
+def _require_pdfium() -> object:
+    if pdfium is None:
+        raise RuntimeError("PDF support requires pypdfium2.")
+    return pdfium
+
+
+def get_pdf_page_count(path: Path) -> int:
+    engine = _require_pdfium()
+    document = engine.PdfDocument(str(path))
+    try:
+        return len(document)
+    finally:
+        close = getattr(document, "close", None)
+        if callable(close):
+            close()
+
+
+def _render_pdf_page(path: Path, page_index: int, scale: float = 2.0) -> Image.Image:
+    engine = _require_pdfium()
+    document = engine.PdfDocument(str(path))
+    page = None
+    bitmap = None
+    try:
+        page = document[page_index]
+        with _suppress_native_output():
+            bitmap = page.render(scale=scale, rev_byteorder=True)
+        image = bitmap.to_pil().convert("RGB")
+        image.load()
+        return image
+    finally:
+        for obj in (bitmap, page, document):
+            close = getattr(obj, "close", None)
+            if callable(close):
+                close()
+
+
+def load_document_page_image(source: DocumentPage, *, scale: float = 2.0) -> Image.Image:
+    if source.page_index is None:
+        return _open_image(source.path).convert("RGB")
+    return _render_pdf_page(source.path, source.page_index, scale=scale)
+
+
+def list_input_pages(folder: Path, recursive: bool = False) -> list[DocumentPage]:
+    iterator = folder.rglob("*") if recursive else folder.glob("*")
+    sources: list[DocumentPage] = []
+    for path in sorted(item for item in iterator if item.is_file() and item.suffix.lower() in SUPPORTED_EXTENSIONS):
+        if path.suffix.lower() == ".pdf":
+            for page_index in range(get_pdf_page_count(path)):
+                sources.append(DocumentPage(path=path, page_index=page_index))
+        else:
+            sources.append(DocumentPage(path=path))
+    return sources
+
 try:
     with _suppress_native_output():
         from paddleocr import PaddleOCR
 except ImportError:
     PaddleOCR = None
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
 
 _LOG = logging.getLogger("jpeg_pars.ocr")
 
@@ -334,6 +415,7 @@ class ParsedSheet:
     values: dict[str, str]
     confidences: dict[str, float]
     debug_candidates: dict[str, list["OcrCandidate"]]
+    page_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -351,9 +433,8 @@ class OcrCandidate:
     score: float
 
 
-def list_jpeg_files(folder: Path, recursive: bool = False) -> list[Path]:
-    iterator = folder.rglob("*") if recursive else folder.glob("*")
-    return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS)
+def list_jpeg_files(folder: Path, recursive: bool = False) -> list[DocumentPage]:
+    return list_input_pages(folder, recursive=recursive)
 
 
 def default_region_name(index: int) -> str:
@@ -376,10 +457,10 @@ def parse_template_batch(
     _LOG.info("parse_template_batch: %d file(s), %d region(s), backend=%s, model=%s",
               len(files), len(regions), _preferred_backend(ocr_config), ocr_config.ocr_version)
     results: list[ParsedSheet] = []
-    for path in files:
+    for source in files:
         t_file = time.perf_counter()
-        image = _open_image(path).convert("RGB")
-        _LOG.info("── FILE: %s  size=%dx%d", path.name, image.width, image.height)
+        image = load_document_page_image(source)
+        _LOG.info("── FILE: %s  size=%dx%d", source.display_name, image.width, image.height)
         values: dict[str, str] = {}
         confidences: dict[str, float] = {}
         debug_candidates: dict[str, list[OcrCandidate]] = {}
@@ -398,11 +479,12 @@ def parse_template_batch(
         _LOG.info("── FILE done: %.0fms", (time.perf_counter() - t_file) * 1000)
         results.append(
             ParsedSheet(
-                file_name=path.name,
-                file_path=str(path),
+                file_name=source.display_name,
+                file_path=str(source.path),
                 values=values,
                 confidences=confidences,
                 debug_candidates=debug_candidates,
+                page_index=source.page_index,
             )
         )
     return results
@@ -596,20 +678,26 @@ def export_results_to_excel(
     workbook.save(destination)
 
 
-def save_template(regions: list[TemplateRegion], image_path: Path | None, destination: Path) -> None:
+def save_template(
+    regions: list[TemplateRegion],
+    image_path: Path | None,
+    destination: Path,
+    page_index: int | None = None,
+) -> None:
     payload = {
         "image_path": (str(image_path) if image_path else None),
+        "page_index": page_index,
         "regions": [asdict(region) for region in regions],
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def load_template(source: Path) -> tuple[Path | None, list[TemplateRegion]]:
+def load_template(source: Path) -> tuple[Path | None, int | None, list[TemplateRegion]]:
     payload = json.loads(source.read_text(encoding="utf-8"))
     image_path = Path(payload["image_path"]) if payload.get("image_path") else None
     regions = [TemplateRegion(**item) for item in payload.get("regions", [])]
-    return image_path, regions
+    return image_path, payload.get("page_index"), regions
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -1609,14 +1697,14 @@ def _extract_ocr_features(image: Image.Image, ocr_config: OcrConfig | None) -> t
     return frozenset(sorted(tokens)), bands, True
 
 
-def load_features(path: Path, ocr_config: OcrConfig | None = None) -> ImageFeatures:
-    image = _open_image(path).convert("L")
+def load_features(source: DocumentPage, ocr_config: OcrConfig | None = None) -> ImageFeatures:
+    image = load_document_page_image(source).convert("L")
     normalized = _normalize_image(image)
     binary = _binary_map(normalized)
     edge_map = _edge_map(normalized)
     ocr_tokens, ocr_bands, ocr_enabled = _extract_ocr_features(image, ocr_config)
     return ImageFeatures(
-        path=path,
+        source=source,
         phash=_phash(normalized),
         dhash=_dhash(normalized),
         edge_map=edge_map,
@@ -1728,9 +1816,8 @@ class UnionFind:
             self.rank[left_root] += 1
 
 
-def discover_images(input_dir: Path, recursive: bool) -> list[Path]:
-    iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
-    return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS)
+def discover_images(input_dir: Path, recursive: bool) -> list[DocumentPage]:
+    return list_input_pages(input_dir, recursive=recursive)
 
 
 def cluster_images(
@@ -1741,26 +1828,32 @@ def cluster_images(
 ) -> ClusterResult:
     files = discover_images(input_dir, recursive=recursive)
     if not files:
-        raise ValueError(f"No JPEG files found in {input_dir}")
+        raise ValueError(f"No JPEG/PDF files found in {input_dir}")
     features = [load_features(path, ocr_config=ocr_config) for path in files]
     union_find = UnionFind(len(features))
     for left_index in range(len(features)):
         for right_index in range(left_index + 1, len(features)):
             if combined_similarity(features[left_index], features[right_index]) >= similarity_threshold:
                 union_find.union(left_index, right_index)
-    grouped: dict[int, list[Path]] = {}
+    grouped: dict[int, list[DocumentPage]] = {}
     for index, item in enumerate(features):
-        grouped.setdefault(union_find.find(index), []).append(item.path)
-    groups = sorted((sorted(paths) for paths in grouped.values()), key=lambda paths: (-len(paths), str(paths[0]).lower()))
-    feature_by_path = {feature.path: feature for feature in features}
+        grouped.setdefault(union_find.find(index), []).append(item.source)
+    groups = sorted(
+        (
+            sorted(paths, key=lambda item: (str(item.path).lower(), item.page_index if item.page_index is not None else -1))
+            for paths in grouped.values()
+        ),
+        key=lambda paths: (-len(paths), str(paths[0].path).lower(), paths[0].page_index if paths[0].page_index is not None else -1),
+    )
+    feature_by_path = {feature.source: feature for feature in features}
     scores: dict[str, dict[str, float]] = {}
     for group in groups:
         if len(group) < 2:
             continue
         anchor = group[0]
-        scores[str(anchor)] = {}
+        scores[anchor.display_name] = {}
         for path in group[1:]:
-            scores[str(anchor)][str(path)] = combined_similarity(feature_by_path[anchor], feature_by_path[path])
+            scores[anchor.display_name][path.display_name] = combined_similarity(feature_by_path[anchor], feature_by_path[path])
     return ClusterResult(groups=groups, scores=scores, ocr_enabled=any(feature.ocr_enabled for feature in features))
 
 
@@ -1779,13 +1872,16 @@ def materialize_groups(
         group_dir = output_dir / f"group_{index:03d}"
         group_dir.mkdir(parents=True, exist_ok=True)
         for item in group:
-            destination = group_dir / item.name
+            destination = group_dir / item.output_name
             if destination.exists():
-                destination = group_dir / f"{item.stem}_{abs(hash(item)) % 100000}{item.suffix.lower()}"
-            if mode == "move":
-                shutil.move(str(item), str(destination))
+                destination = group_dir / f"{destination.stem}_{abs(hash(item)) % 100000}{destination.suffix.lower()}"
+            if item.page_index is not None:
+                rendered = load_document_page_image(item, scale=2.0)
+                rendered.save(destination, quality=95)
+            elif mode == "move":
+                shutil.move(str(item.path), str(destination))
             else:
-                shutil.copy2(item, destination)
+                shutil.copy2(item.path, destination)
     report = {
         "source_root": str(source_root),
         "group_count": len(result.groups),
@@ -1796,7 +1892,18 @@ def materialize_groups(
             "psm": (ocr_config.psm if ocr_config else 6),
         },
         "groups": [
-            {"group": f"group_{index:03d}", "size": len(group), "files": [str(path) for path in group]}
+            {
+                "group": f"group_{index:03d}",
+                "size": len(group),
+                "files": [
+                    {
+                        "path": str(path.path),
+                        "page_index": path.page_index,
+                        "display_name": path.display_name,
+                    }
+                    for path in group
+                ],
+            }
             for index, group in enumerate(result.groups, start=1)
             if len(group) >= min_group_size
         ],
@@ -1806,12 +1913,12 @@ def materialize_groups(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jpeg-pars", description="Sort JPEG drawings into folders based on visual similarity.")
-    parser.add_argument("--input", required=True, type=Path, help="Folder with JPEG images.")
+    parser = argparse.ArgumentParser(prog="jpeg-pars", description="Sort JPEG drawings and PDF pages into folders based on visual similarity.")
+    parser.add_argument("--input", required=True, type=Path, help="Folder with JPEG images and/or PDF files.")
     parser.add_argument("--output", required=True, type=Path, help="Folder where grouped files will be written.")
     parser.add_argument("--similarity", required=True, type=int, help="Similarity threshold from 1 to 100.")
     parser.add_argument("--mode", choices=("copy", "move"), default="copy", help="Copy files by default; move if requested.")
-    parser.add_argument("--recursive", action="store_true", help="Search JPEG files in nested folders.")
+    parser.add_argument("--recursive", action="store_true", help="Search JPEG/PDF files in nested folders.")
     parser.add_argument("--min-group-size", type=int, default=1, help="Skip writing groups smaller than this value.")
     parser.add_argument("--ocr-mode", choices=("auto", "off", "required"), default="auto", help="Use OCR in auto mode, disable it, or require it.")
     parser.add_argument("--tesseract-cmd", type=str, default=None, help="Path to Tesseract installation, DLL folder, or tesseract.exe.")
@@ -1852,4 +1959,4 @@ def main() -> None:
         ocr_config=ocr_config,
     )
     file_count = sum(len(group) for group in result.groups)
-    print(f"Processed {file_count} files into {len(result.groups)} groups. OCR active: {'yes' if result.ocr_enabled else 'no'}. Output: {args.output}")
+    print(f"Processed {file_count} pages/items into {len(result.groups)} groups. OCR active: {'yes' if result.ocr_enabled else 'no'}. Output: {args.output}")
